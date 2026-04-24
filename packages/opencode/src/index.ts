@@ -39,6 +39,7 @@ import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import { ensureProcessMetadata } from "./util/opencode-process"
+import fs from "fs/promises"
 
 const processMetadata = ensureProcessMetadata("main")
 
@@ -96,8 +97,12 @@ const cli = yargs(args)
       [process.argv[0], process.argv[1], process.execPath].some((item) => path.basename(item ?? "") === "opencode_debug") ||
       process.env.OPENCODE_DEBUG_DEFAULT === "1"
     if (debugDefault) process.env.OPENCODE_DEBUG_DEFAULT = "1"
+    if (debugDefault) {
+      Global.Path.log = path.join(process.cwd(), ".opencode", "logs")
+      await fs.mkdir(Global.Path.log, { recursive: true })
+    }
     await Log.init({
-      print: debugDefault || process.argv.includes("--print-logs"),
+      print: process.argv.includes("--print-logs"),
       dev: Installation.isLocal(),
       level: (() => {
         if (opts.logLevel) return opts.logLevel as Log.Level
@@ -118,6 +123,7 @@ const cli = yargs(args)
       args: process.argv.slice(2),
       process_role: processMetadata.processRole,
       run_id: processMetadata.runID,
+      log_path: Log.file(),
     })
 
     const marker = path.join(Global.Path.data, "opencode.db")
