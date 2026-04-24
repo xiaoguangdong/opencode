@@ -12,6 +12,10 @@ function on(value: string | undefined) {
   return ["1", "true", "yes", "on", "debug", "trace"].includes(value.toLowerCase())
 }
 
+function scrubSecrets() {
+  return on(process.env.OPENCODE_TRACE_SCRUB)
+}
+
 export function enabled(scope?: string) {
   if (process.env.OPENCODE_DEBUG_DEFAULT === "1") return true
   if (on(process.env.OPENCODE_TRACE)) return true
@@ -26,7 +30,7 @@ function limitString(input: string) {
 }
 
 function scrub(value: unknown, depth: number, seen: WeakSet<object>, key?: string): unknown {
-  if (key && secretPattern.test(key)) {
+  if (scrubSecrets() && key && secretPattern.test(key)) {
     if (value === undefined || value === null || value === "") return value
     return "[已脱敏]"
   }
