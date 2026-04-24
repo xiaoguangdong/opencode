@@ -5,6 +5,9 @@ import * as Session from "./session"
 import { MessageV2 } from "./message-v2"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { Trace } from "@/util"
+
+const trace = Trace.create("session.run-state", "packages/opencode/src/session/run-state.ts")
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void>
@@ -51,13 +54,24 @@ export const layer = Layer.effect(
     ) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      if (existing) return existing
+      if (existing) {
+        trace.info("RunState 复用已有 session runner", {
+          sessionID,
+          busy: existing.busy,
+        })
+        return existing
+      }
+      trace.info("RunState 创建新的 session runner", { sessionID })
       const next = Runner.make<MessageV2.WithParts>(data.scope, {
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
+          trace.info("RunState runner 进入 idle", { sessionID })
           yield* status.set(sessionID, { type: "idle" })
         }),
-        onBusy: status.set(sessionID, { type: "busy" }),
+        onBusy: Effect.gen(function* () {
+          trace.info("RunState runner 进入 busy", { sessionID })
+          yield* status.set(sessionID, { type: "busy" })
+        }),
         onInterrupt,
         busy: () => {
           throw new Session.BusyError(sessionID)
@@ -70,12 +84,22 @@ export const layer = Layer.effect(
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
+      trace.info("RunState 检查会话是否忙碌", {
+        sessionID,
+        found: Boolean(existing),
+        busy: existing?.busy,
+      })
       if (existing?.busy) throw new Session.BusyError(sessionID)
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
+      trace.info("RunState 收到取消请求", {
+        sessionID,
+        found: Boolean(existing),
+        busy: existing?.busy,
+      })
       if (!existing || !existing.busy) {
         yield* status.set(sessionID, { type: "idle" })
         return
@@ -88,6 +112,7 @@ export const layer = Layer.effect(
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
       work: Effect.Effect<MessageV2.WithParts>,
     ) {
+      trace.info("RunState 确保会话运行主循环", { sessionID })
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
     })
 
@@ -96,6 +121,7 @@ export const layer = Layer.effect(
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
       work: Effect.Effect<MessageV2.WithParts>,
     ) {
+      trace.info("RunState 启动 shell 模式任务", { sessionID })
       return yield* (yield* runner(sessionID, onInterrupt)).startShell(work)
     })
 

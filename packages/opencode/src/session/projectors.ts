@@ -3,9 +3,10 @@ import { SyncEvent } from "@/sync"
 import * as Session from "./session"
 import { MessageV2 } from "./message-v2"
 import { SessionTable, MessageTable, PartTable } from "./session.sql"
-import { Log } from "../util"
+import { Log, Trace } from "../util"
 
 const log = Log.create({ service: "session.projector" })
+const trace = Trace.create("session.projector", "packages/opencode/src/session/projectors.ts")
 
 function foreign(err: unknown) {
   if (typeof err !== "object" || err === null) return false
@@ -62,11 +63,19 @@ export function toPartialRow(info: DeepPartial<Session.Info>) {
 
 export default [
   SyncEvent.project(Session.Event.Created, (db, data) => {
+    trace.info("Projector 将 session.created 写入 SQLite", {
+      sessionID: data.sessionID,
+      info: data.info,
+    })
     db.insert(SessionTable).values(Session.toRow(data.info)).run()
   }),
 
   SyncEvent.project(Session.Event.Updated, (db, data) => {
     const info = data.info
+    trace.info("Projector 将 session.updated 写入 SQLite", {
+      sessionID: data.sessionID,
+      info,
+    })
     const row = db
       .update(SessionTable)
       .set(toPartialRow(info))
@@ -77,12 +86,22 @@ export default [
   }),
 
   SyncEvent.project(Session.Event.Deleted, (db, data) => {
+    trace.info("Projector 将 session.deleted 写入 SQLite", {
+      sessionID: data.sessionID,
+      info: data.info,
+    })
     db.delete(SessionTable).where(eq(SessionTable.id, data.sessionID)).run()
   }),
 
   SyncEvent.project(MessageV2.Event.Updated, (db, data) => {
     const time_created = data.info.time.created
     const { id, sessionID, ...rest } = data.info
+    trace.info("Projector 将 message.updated 写入 SQLite", {
+      sessionID,
+      messageID: id,
+      role: data.info.role,
+      info: data.info,
+    })
 
     try {
       db.insert(MessageTable)
@@ -101,12 +120,14 @@ export default [
   }),
 
   SyncEvent.project(MessageV2.Event.Removed, (db, data) => {
+    trace.info("Projector 将 message.removed 写入 SQLite", data)
     db.delete(MessageTable)
       .where(and(eq(MessageTable.id, data.messageID), eq(MessageTable.session_id, data.sessionID)))
       .run()
   }),
 
   SyncEvent.project(MessageV2.Event.PartRemoved, (db, data) => {
+    trace.info("Projector 将 message.part.removed 写入 SQLite", data)
     db.delete(PartTable)
       .where(and(eq(PartTable.id, data.partID), eq(PartTable.session_id, data.sessionID)))
       .run()
@@ -114,6 +135,13 @@ export default [
 
   SyncEvent.project(MessageV2.Event.PartUpdated, (db, data) => {
     const { id, messageID, sessionID, ...rest } = data.part
+    trace.info("Projector 将 message.part.updated 写入 SQLite", {
+      sessionID,
+      messageID,
+      partID: id,
+      type: data.part.type,
+      part: data.part,
+    })
 
     try {
       db.insert(PartTable)

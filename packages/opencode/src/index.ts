@@ -92,11 +92,16 @@ const cli = yargs(args)
       process.env.OPENCODE_PURE = "1"
     }
 
+    const debugDefault =
+      [process.argv[0], process.argv[1], process.execPath].some((item) => path.basename(item ?? "") === "opencode_debug") ||
+      process.env.OPENCODE_DEBUG_DEFAULT === "1"
+    if (debugDefault) process.env.OPENCODE_DEBUG_DEFAULT = "1"
     await Log.init({
-      print: process.argv.includes("--print-logs"),
+      print: debugDefault || process.argv.includes("--print-logs"),
       dev: Installation.isLocal(),
       level: (() => {
         if (opts.logLevel) return opts.logLevel as Log.Level
+        if (debugDefault) return "DEBUG"
         if (Installation.isLocal()) return "DEBUG"
         return "INFO"
       })(),

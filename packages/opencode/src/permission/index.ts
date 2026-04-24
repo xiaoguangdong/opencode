@@ -7,7 +7,7 @@ import { MessageID, SessionID } from "@/session/schema"
 import { PermissionTable } from "@/session/session.sql"
 import { Database, eq } from "@/storage"
 import { zod } from "@/util/effect-zod"
-import { Log } from "@/util"
+import { Log, Trace } from "@/util"
 import { withStatics } from "@/util/schema"
 import { Wildcard } from "@/util"
 import { Deferred, Effect, Layer, Schema, Context } from "effect"
@@ -16,6 +16,7 @@ import { evaluate as evalRule } from "./evaluate"
 import { PermissionID } from "./schema"
 
 const log = Log.create({ service: "permission" })
+const trace = Trace.create("permission", "packages/opencode/src/permission/index.ts")
 
 export const Action = Schema.Literals(["allow", "deny", "ask"])
   .annotate({ identifier: "PermissionAction" })
@@ -145,7 +146,14 @@ interface State {
 
 export function evaluate(permission: string, pattern: string, ...rulesets: Ruleset[]): Rule {
   log.info("evaluate", { permission, pattern, ruleset: rulesets.flat() })
-  return evalRule(permission, pattern, ...rulesets)
+  const result = evalRule(permission, pattern, ...rulesets)
+  trace.info("Permission 规则评估完成", {
+    permission,
+    pattern,
+    ruleset: rulesets.flat(),
+    result,
+  })
+  return result
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
@@ -181,11 +189,25 @@ export const layer = Layer.effect(
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
       let needsAsk = false
+      trace.info("Permission 收到权限检查请求", {
+        permission: request.permission,
+        sessionID: request.sessionID,
+        patterns: request.patterns,
+        metadata: request.metadata,
+        tool: request.tool,
+        ruleset,
+        approved,
+      })
 
       for (const pattern of request.patterns) {
         const rule = evaluate(request.permission, pattern, ruleset, approved)
         log.info("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
+          trace.warn("Permission 根据规则直接拒绝", {
+            permission: request.permission,
+            pattern,
+            rule,
+          })
           return yield* new DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
@@ -194,7 +216,13 @@ export const layer = Layer.effect(
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      if (!needsAsk) {
+        trace.info("Permission 根据规则直接允许", {
+          permission: request.permission,
+          patterns: request.patterns,
+        })
+        return
+      }
 
       const id = request.id ?? PermissionID.ascending()
       const info = Schema.decodeUnknownSync(Request)({
@@ -202,6 +230,10 @@ export const layer = Layer.effect(
         ...request,
       })
       log.info("asking", { id, permission: info.permission, patterns: info.patterns })
+      trace.info("Permission 需要用户审批，发布 permission.asked", {
+        requestID: id,
+        request: info,
+      })
 
       const deferred = yield* Deferred.make<void, RejectedError | CorrectedError>()
       pending.set(id, { info, deferred })
@@ -217,9 +249,20 @@ export const layer = Layer.effect(
     const reply = Effect.fn("Permission.reply")(function* (input: ReplyInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const existing = pending.get(input.requestID)
+      trace.info("Permission 收到用户审批回复", {
+        requestID: input.requestID,
+        reply: input.reply,
+        message: input.message,
+        found: Boolean(existing),
+      })
       if (!existing) return
 
       pending.delete(input.requestID)
+      trace.info("Permission 发布 permission.replied", {
+        sessionID: existing.info.sessionID,
+        requestID: existing.info.id,
+        reply: input.reply,
+      })
       yield* bus.publish(Event.Replied, {
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,

@@ -1,8 +1,10 @@
 import type { Context } from "hono"
 import { Effect } from "effect"
 import { AppRuntime } from "@/effect/app-runtime"
+import { Trace } from "@/util"
 
 type AppEnv = Parameters<typeof AppRuntime.runPromise>[0] extends Effect.Effect<any, any, infer R> ? R : never
+const trace = Trace.create("server.route", "packages/opencode/src/server/routes/instance/trace.ts")
 
 // Build the base span attributes for an HTTP handler: method, path, and every
 // matched route param. Names follow OTel attribute-naming guidance:
@@ -41,7 +43,23 @@ export function requestAttributes(c: RequestLike): Record<string, string> {
 }
 
 export function runRequest<A, E>(name: string, c: Context, effect: Effect.Effect<A, E, AppEnv>) {
-  return AppRuntime.runPromise(effect.pipe(Effect.withSpan(name, { attributes: requestAttributes(c) })))
+  const attributes = requestAttributes(c)
+  trace.info("HTTP 路由开始执行 Effect 请求", { name, attributes })
+  return AppRuntime.runPromise(
+    effect.pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          trace.info("HTTP 路由 Effect 请求执行完成", { name, attributes, result })
+        }),
+      ),
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          trace.error("HTTP 路由 Effect 请求执行失败", { name, attributes, error })
+        }),
+      ),
+      Effect.withSpan(name, { attributes }),
+    ),
+  )
 }
 
 export async function jsonRequest<C extends Context, A, E>(

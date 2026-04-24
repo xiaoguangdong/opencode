@@ -14,7 +14,7 @@ import type { SQL } from "../storage"
 import { PartTable, SessionTable } from "./session.sql"
 import { ProjectTable } from "../project/project.sql"
 import { Storage } from "@/storage"
-import { Log } from "../util"
+import { Log, Trace } from "../util"
 import { updateSchema } from "../util/update-schema"
 import { MessageV2 } from "./message-v2"
 import { Instance } from "../project/instance"
@@ -30,6 +30,7 @@ import { Global } from "@/global"
 import { Effect, Layer, Option, Context } from "effect"
 
 const log = Log.create({ service: "session" })
+const trace = Trace.create("session.service", "packages/opencode/src/session/session.ts")
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -415,6 +416,15 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
         },
       }
       log.info("created", result)
+      trace.info("Session Service 创建新会话", {
+        sessionID: result.id,
+        parentID: result.parentID,
+        projectID: result.projectID,
+        workspaceID: result.workspaceID,
+        directory: result.directory,
+        title: result.title,
+        permission: result.permission,
+      })
 
       yield* Effect.sync(() => SyncEvent.run(Event.Created, { sessionID: result.id, info: result }))
 
@@ -431,9 +441,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     })
 
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
+      trace.info("Session Service 读取会话", { sessionID: id })
       const row = yield* db((d) => d.select().from(SessionTable).where(eq(SessionTable.id, id)).get())
       if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
-      return fromRow(row)
+      const result = fromRow(row)
+      trace.info("Session Service 读取会话完成", { sessionID: id, session: result })
+      return result
     })
 
     const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
@@ -475,12 +488,25 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
 
     const updateMessage = <T extends MessageV2.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        trace.info("Session Service 更新 Message，准备写入 SyncEvent/SQLite", {
+          sessionID: msg.sessionID,
+          messageID: msg.id,
+          role: msg.role,
+          parentID: msg.role === "assistant" ? msg.parentID : undefined,
+        })
         yield* Effect.sync(() => SyncEvent.run(MessageV2.Event.Updated, { sessionID: msg.sessionID, info: msg }))
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends MessageV2.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        trace.info("Session Service 更新 Message Part，准备写入 SyncEvent/SQLite", {
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          partID: part.id,
+          type: part.type,
+          part,
+        })
         yield* Effect.sync(() =>
           SyncEvent.run(MessageV2.Event.PartUpdated, {
             sessionID: part.sessionID,
@@ -522,6 +548,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     }) {
       const directory = yield* InstanceState.directory
       const workspace = yield* InstanceState.workspaceID
+      trace.info("Session Service 收到创建会话请求", {
+        directory,
+        workspaceID: workspace,
+        input,
+      })
       return yield* createNext({
         parentID: input?.parentID,
         directory,
@@ -569,7 +600,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     })
 
     const patch = (sessionID: SessionID, info: Patch) =>
-      Effect.sync(() => SyncEvent.run(Event.Updated, { sessionID, info }))
+      Effect.sync(() => {
+        trace.info("Session Service 更新会话字段，准备写入 SyncEvent/SQLite", {
+          sessionID,
+          info,
+        })
+        SyncEvent.run(Event.Updated, { sessionID, info })
+      })
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
       yield* patch(sessionID, { time: { updated: Date.now() } })
@@ -616,10 +653,22 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     })
 
     const messages = Effect.fn("Session.messages")(function* (input: { sessionID: SessionID; limit?: number }) {
+      trace.info("Session Service 读取会话消息列表", input)
       if (input.limit) {
-        return MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).items
+        const result = MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).items
+        trace.info("Session Service 读取分页消息完成", {
+          sessionID: input.sessionID,
+          limit: input.limit,
+          count: result.length,
+        })
+        return result
       }
-      return Array.from(MessageV2.stream(input.sessionID)).reverse()
+      const result = Array.from(MessageV2.stream(input.sessionID)).reverse()
+      trace.info("Session Service 读取全部消息完成", {
+        sessionID: input.sessionID,
+        count: result.length,
+      })
+      return result
     })
 
     const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
@@ -657,6 +706,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       field: string
       delta: string
     }) {
+      trace.info("Session Service 发布 Part 增量到 Bus", input)
       yield* bus.publish(MessageV2.Event.PartDelta, input)
     })
 

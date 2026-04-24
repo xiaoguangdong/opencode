@@ -1,13 +1,14 @@
 import z from "zod"
 import { Effect, Exit, Layer, PubSub, Scope, Context, Stream } from "effect"
 import { EffectBridge } from "@/effect"
-import { Log } from "../util"
+import { Log, Trace } from "../util"
 import { BusEvent } from "./bus-event"
 import { GlobalBus } from "./global"
 import { InstanceState } from "@/effect"
 import { makeRuntime } from "@/effect/run-service"
 
 const log = Log.create({ service: "bus" })
+const trace = Trace.create("bus", "packages/opencode/src/bus/index.ts")
 
 export const InstanceDisposed = BusEvent.define(
   "server.instance.disposed",
@@ -84,6 +85,11 @@ export const layer = Layer.effect(
         const s = yield* InstanceState.get(state)
         const payload: Payload = { type: def.type, properties }
         log.info("publishing", { type: def.type })
+        trace.info("Bus 发布事件到实例 PubSub", {
+          type: def.type,
+          properties,
+          hasTypedSubscribers: s.typed.has(def.type),
+        })
 
         const ps = s.typed.get(def.type)
         if (ps) yield* PubSub.publish(ps, payload)
@@ -99,11 +105,18 @@ export const layer = Layer.effect(
           workspace,
           payload,
         })
+        trace.info("Bus 事件已转发到 GlobalBus，等待 TUI/事件流消费", {
+          type: def.type,
+          directory: dir,
+          projectID: context.project.id,
+          workspace,
+        })
       })
     }
 
     function subscribe<D extends BusEvent.Definition>(def: D): Stream.Stream<Payload<D>> {
       log.info("subscribing", { type: def.type })
+      trace.info("订阅指定类型 Bus 事件", { type: def.type })
       return Stream.unwrap(
         Effect.gen(function* () {
           const s = yield* InstanceState.get(state)
@@ -115,6 +128,7 @@ export const layer = Layer.effect(
 
     function subscribeAll(): Stream.Stream<Payload> {
       log.info("subscribing", { type: "*" })
+      trace.info("订阅全部 Bus 事件", { type: "*" })
       return Stream.unwrap(
         Effect.gen(function* () {
           const s = yield* InstanceState.get(state)
@@ -126,6 +140,7 @@ export const layer = Layer.effect(
     function on<T>(pubsub: PubSub.PubSub<T>, type: string, callback: (event: T) => unknown) {
       return Effect.gen(function* () {
         log.info("subscribing", { type })
+        trace.info("注册 Bus 回调订阅者", { type })
         const bridge = yield* EffectBridge.make()
         const scope = yield* Scope.make()
         const subscription = yield* Scope.provide(scope)(PubSub.subscribe(pubsub))
@@ -146,6 +161,7 @@ export const layer = Layer.effect(
 
         return () => {
           log.info("unsubscribing", { type })
+          trace.info("注销 Bus 回调订阅者", { type })
           bridge.fork(Scope.close(scope, Exit.void))
         }
       })

@@ -49,6 +49,7 @@ import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { EffectBridge } from "@/effect"
+import { Trace } from "@/util"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -65,6 +66,7 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 
 const log = Log.create({ service: "session.prompt" })
 const elog = EffectLogger.create({ service: "session.prompt" })
+const trace = Trace.create("session", "packages/opencode/src/session/prompt.ts")
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -361,6 +363,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       messages: MessageV2.WithParts[]
     }) {
       using _ = log.time("resolveTools")
+      trace.info("开始解析本轮可用工具", {
+        sessionID: input.session.id,
+        messageID: input.processor.message.id,
+        agent: input.agent.name,
+        model: `${input.model.providerID}/${input.model.id}`,
+        requestedTools: input.tools,
+        bypassAgentCheck: input.bypassAgentCheck,
+        historyMessageCount: input.messages.length,
+      })
       const tools: Record<string, AITool> = {}
       const run = yield* runner()
       const promptOps = yield* ops()
@@ -411,6 +422,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             return run.promise(
               Effect.gen(function* () {
                 const ctx = context(args, options)
+                trace.info("工具开始执行", {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.messageID,
+                  callID: ctx.callID,
+                  tool: item.id,
+                  args,
+                  source: "builtin",
+                })
                 yield* plugin.trigger(
                   "tool.execute.before",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -431,6 +450,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
                   output,
                 )
+                trace.info("工具执行完成", {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.messageID,
+                  callID: ctx.callID,
+                  tool: item.id,
+                  source: "builtin",
+                  output,
+                })
                 if (options.abortSignal?.aborted) {
                   yield* input.processor.completeToolCall(options.toolCallId, output)
                 }
@@ -452,6 +479,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           run.promise(
             Effect.gen(function* () {
               const ctx = context(args, opts)
+              trace.info("工具开始执行", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.messageID,
+                callID: ctx.callID,
+                tool: key,
+                args,
+                source: "mcp",
+              })
               yield* plugin.trigger(
                 "tool.execute.before",
                 { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -513,12 +548,27 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (opts.abortSignal?.aborted) {
                 yield* input.processor.completeToolCall(opts.toolCallId, output)
               }
+              trace.info("工具执行完成", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.messageID,
+                callID: ctx.callID,
+                tool: key,
+                source: "mcp",
+                output,
+              })
               return output
             }),
           )
         tools[key] = item
       }
 
+      trace.info("本轮可用工具解析完成", {
+        sessionID: input.session.id,
+        messageID: input.processor.message.id,
+        agent: input.agent.name,
+        toolCount: Object.keys(tools).length,
+        tools: Object.keys(tools),
+      })
       return tools
     })
 
@@ -952,6 +1002,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         system: input.system,
         format: input.format,
       }
+      trace.info("用户输入已解析为内部 user message", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        agent: ag.name,
+        model: info.model,
+        system: input.system,
+        toolOverrides: input.tools,
+        format: input.format,
+        partCount: input.parts.length,
+        rawParts: input.parts,
+      })
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
 
@@ -1269,12 +1330,30 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
+      trace.info("用户消息和附件已写入会话存储", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        agent: info.agent,
+        model: info.model,
+        resolvedPartCount: parts.length,
+        resolvedParts: parts,
+      })
 
       return { info, parts }
     }, Effect.scoped)
 
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
+        trace.info("收到新的用户 prompt 请求", {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          agent: input.agent,
+          model: input.model,
+          variant: input.variant,
+          noReply: input.noReply,
+          partCount: input.parts.length,
+          parts: input.parts,
+        })
         const session = yield* sessions.get(input.sessionID)
         yield* revert.cleanup(session)
         const message = yield* createUserMessage(input)
@@ -1287,9 +1366,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (permissions.length > 0) {
           session.permission = permissions
           yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+          trace.info("已根据本次 prompt 覆盖会话权限", {
+            sessionID: session.id,
+            permissions,
+          })
         }
 
-        if (input.noReply === true) return message
+        if (input.noReply === true) {
+          trace.info("本次 prompt 设置 noReply，跳过模型回复", {
+            sessionID: input.sessionID,
+            messageID: message.info.id,
+          })
+          return message
+        }
         return yield* loop({ sessionID: input.sessionID })
       },
     )
@@ -1313,6 +1402,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* slog.info("loop", { step })
+          trace.info("会话循环开始新一轮", { sessionID, step })
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
@@ -1331,6 +1421,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          trace.info("会话循环已读取上下文", {
+            sessionID,
+            step,
+            messageCount: msgs.length,
+            lastUser,
+            lastAssistant,
+            lastFinished,
+            pendingTasks: tasks,
+          })
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1362,6 +1461,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+          trace.info("会话循环已解析模型", {
+            sessionID,
+            step,
+            requestedModel: lastUser.model,
+            resolvedModel: {
+              id: model.id,
+              providerID: model.providerID,
+              api: model.api,
+              capabilities: model.capabilities,
+              limit: model.limit,
+              options: model.options,
+              headers: model.headers,
+              variants: model.variants,
+            },
+          })
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
@@ -1437,6 +1551,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               bypassAgentCheck,
               messages: msgs,
             })
+            trace.info("准备调用 LLM 处理器", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              userMessageID: lastUser.id,
+              agent: agent.name,
+              model: `${model.providerID}/${model.id}`,
+              toolCount: Object.keys(tools).length,
+              tools: Object.keys(tools),
+              bypassAgentCheck,
+              isLastStep,
+              maxSteps,
+            })
 
             if (lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
@@ -1479,6 +1606,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const system = [...env, ...(skills ? [skills] : []), ...instructions]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            trace.info("即将进入 LLM 处理器，已生成 system 与 model messages", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              format,
+              system,
+              modelMessages: modelMsgs,
+            })
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1490,6 +1625,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
+            })
+            trace.info("LLM 处理器返回结果", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              result,
+              finish: handle.message.finish,
+              error: handle.message.error,
+              tokens: handle.message.tokens,
+              cost: handle.message.cost,
             })
 
             if (structured !== undefined) {

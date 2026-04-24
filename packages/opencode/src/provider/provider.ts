@@ -26,11 +26,13 @@ import { InstanceState } from "@/effect"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { isRecord } from "@/util/record"
 import { withStatics } from "@/util/schema"
+import { Trace } from "@/util"
 
 import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
 
 const log = Log.create({ service: "provider" })
+const trace = Trace.create("provider", "packages/opencode/src/provider/provider.ts")
 
 function shouldUseCopilotResponsesApi(modelID: string): boolean {
   const match = /^gpt-(\d+)/.exec(modelID)
@@ -1115,6 +1117,16 @@ const layer: Layer.Layer<
         const configProviders = Object.entries(cfg.provider ?? {})
         const disabled = new Set(cfg.disabled_providers ?? [])
         const enabled = cfg.enabled_providers ? new Set(cfg.enabled_providers) : null
+        trace.info("开始加载 provider 状态", {
+          configuredProviders: configProviders.map(([providerID, provider]) => ({
+            providerID,
+            provider,
+          })),
+          disabledProviders: [...disabled],
+          enabledProviders: enabled ? [...enabled] : undefined,
+          configuredModel: cfg.model,
+          configuredSmallModel: cfg.small_model,
+        })
 
         function isProviderAllowed(providerID: ProviderID): boolean {
           if (enabled && !enabled.has(providerID)) return false
@@ -1125,6 +1137,11 @@ const layer: Layer.Layer<
         // extend database from config
         for (const [providerID, provider] of configProviders) {
           const existing = database[providerID]
+          trace.info("开始合并配置中的 provider", {
+            providerID,
+            provider,
+            hasModelsDevProvider: Boolean(existing),
+          })
           const parsed: Info = {
             id: ProviderID.make(providerID),
             name: provider.name ?? existing?.name ?? providerID,
@@ -1207,6 +1224,12 @@ const layer: Layer.Layer<
             parsed.models[modelID] = parsedModel
           }
           database[providerID] = parsed
+          trace.info("配置中的 provider 已合并到模型数据库", {
+            providerID,
+            modelCount: Object.keys(parsed.models).length,
+            models: Object.keys(parsed.models),
+            options: parsed.options,
+          })
         }
 
         // load env
@@ -1216,6 +1239,10 @@ const layer: Layer.Layer<
           if (disabled.has(providerID)) continue
           const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
+          trace.info("发现环境变量中的 provider 凭据", {
+            providerID,
+            env: provider.env,
+          })
           mergeProvider(providerID, {
             source: "env",
             key: provider.env.length === 1 ? apiKey : undefined,
@@ -1228,6 +1255,10 @@ const layer: Layer.Layer<
           const providerID = ProviderID.make(id)
           if (disabled.has(providerID)) continue
           if (provider.type === "api") {
+            trace.info("发现 auth.json 中的 provider API 凭据", {
+              providerID,
+              authType: provider.type,
+            })
             mergeProvider(providerID, {
               source: "api",
               key: provider.key,
@@ -1266,6 +1297,14 @@ const layer: Layer.Layer<
           }
           const result = yield* fn(data)
           if (result && (result.autoload || providers[providerID])) {
+            trace.info("provider 自定义加载器生效", {
+              providerID,
+              autoload: result.autoload,
+              hasModelLoader: Boolean(result.getModel),
+              hasVarsLoader: Boolean(result.vars),
+              hasDiscoverModels: Boolean(result.discoverModels),
+              options: result.options,
+            })
             if (result.getModel) modelLoaders[providerID] = result.getModel
             if (result.vars) varsLoaders[providerID] = result.vars
             if (result.discoverModels) discoveryLoaders[providerID] = result.discoverModels
@@ -1370,8 +1409,30 @@ const layer: Layer.Layer<
           }
 
           log.info("found", { providerID })
+          trace.info("provider 可用", {
+            providerID,
+            source: provider.source,
+            env: provider.env,
+            options: provider.options,
+            modelCount: Object.keys(provider.models).length,
+            models: Object.keys(provider.models),
+          })
         }
 
+        trace.info("provider 状态加载完成", {
+          providerCount: Object.keys(providers).length,
+          providers: Object.fromEntries(
+            Object.entries(providers).map(([providerID, provider]) => [
+              providerID,
+              {
+                source: provider.source,
+                options: provider.options,
+                modelCount: Object.keys(provider.models).length,
+                models: Object.keys(provider.models),
+              },
+            ]),
+          ),
+        })
         return {
           models: languages,
           providers,
@@ -1426,9 +1487,17 @@ const layer: Layer.Layer<
         if (model.headers)
           options["headers"] = {
             ...options["headers"],
-            ...model.headers,
-          }
+              ...model.headers,
+            }
 
+        trace.info("准备解析 provider SDK", {
+          providerID: model.providerID,
+          modelID: model.id,
+          apiModelID: model.api.id,
+          providerPackage: model.api.npm,
+          baseURL,
+          options,
+        })
         const key = Hash.fast(
           JSON.stringify({
             providerID: model.providerID,
@@ -1437,7 +1506,14 @@ const layer: Layer.Layer<
           }),
         )
         const existing = s.sdk.get(key)
-        if (existing) return existing
+        if (existing) {
+          trace.info("复用已缓存的 provider SDK", {
+            providerID: model.providerID,
+            modelID: model.id,
+            providerPackage: model.api.npm,
+          })
+          return existing
+        }
 
         const customFetch = options["fetch"]
         const chunkTimeout = options["chunkTimeout"]
@@ -1472,10 +1548,30 @@ const layer: Layer.Layer<
             }
           }
 
+          trace.info("即将发出 provider HTTP 请求", {
+            providerID: model.providerID,
+            modelID: model.id,
+            apiModelID: model.api.id,
+            providerPackage: model.api.npm,
+            url: String(input),
+            method: opts.method,
+            headers: opts.headers,
+            body: typeof opts.body === "string" ? safeJson(opts.body) : opts.body,
+            timeout: options["timeout"],
+            chunkTimeout,
+          })
           const res = await fetchFn(input, {
             ...opts,
             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
             timeout: false,
+          })
+          trace.info("provider HTTP 请求已返回", {
+            providerID: model.providerID,
+            modelID: model.id,
+            url: String(input),
+            status: res.status,
+            statusText: res.statusText,
+            headers: Object.fromEntries(res.headers.entries()),
           })
 
           if (!chunkAbortCtl) return res
@@ -1487,6 +1583,10 @@ const layer: Layer.Layer<
           log.info("using bundled provider", {
             providerID: model.providerID,
             pkg: model.api.npm,
+          })
+          trace.info("使用内置 provider SDK", {
+            providerID: model.providerID,
+            providerPackage: model.api.npm,
           })
           const factory = await bundledLoader()
           const loaded = factory({
@@ -1525,7 +1625,22 @@ const layer: Layer.Layer<
     }
 
     const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderID) =>
-      InstanceState.use(state, (s) => s.providers[providerID]),
+      InstanceState.use(state, (s) => {
+        const provider = s.providers[providerID]
+        trace.info("读取 provider 信息", {
+          providerID,
+          found: Boolean(provider),
+          provider: provider
+            ? {
+                source: provider.source,
+                options: provider.options,
+                modelCount: Object.keys(provider.models).length,
+                models: Object.keys(provider.models),
+              }
+            : undefined,
+        })
+        return provider
+      }),
     )
 
     const getModel = Effect.fn("Provider.getModel")(function* (providerID: ProviderID, modelID: ModelID) {
@@ -1543,6 +1658,20 @@ const layer: Layer.Layer<
         const matches = fuzzysort.go(modelID, available, { limit: 3, threshold: -10000 })
         throw new ModelNotFoundError({ providerID, modelID, suggestions: matches.map((m) => m.target) })
       }
+      trace.info("读取模型信息", {
+        providerID,
+        modelID,
+        model: {
+          id: info.id,
+          providerID: info.providerID,
+          api: info.api,
+          capabilities: info.capabilities,
+          limit: info.limit,
+          options: info.options,
+          headers: info.headers,
+          variants: info.variants,
+        },
+      })
       return info
     })
 
@@ -1550,13 +1679,27 @@ const layer: Layer.Layer<
       const s = yield* InstanceState.get(state)
       const envs = yield* env.all()
       const key = `${model.providerID}/${model.id}`
-      if (s.models.has(key)) return s.models.get(key)!
+      if (s.models.has(key)) {
+        trace.info("复用已缓存的语言模型实例", {
+          providerID: model.providerID,
+          modelID: model.id,
+        })
+        return s.models.get(key)!
+      }
 
       return yield* Effect.promise(async () => {
         const provider = s.providers[model.providerID]
         const sdk = await resolveSDK(model, s, envs)
 
         try {
+          trace.info("开始创建语言模型实例", {
+            providerID: model.providerID,
+            modelID: model.id,
+            apiModelID: model.api.id,
+            hasCustomModelLoader: Boolean(s.modelLoaders[model.providerID]),
+            providerOptions: provider.options,
+            modelOptions: model.options,
+          })
           const language = s.modelLoaders[model.providerID]
             ? await s.modelLoaders[model.providerID](sdk, model.api.id, {
                 ...provider.options,
@@ -1564,6 +1707,11 @@ const layer: Layer.Layer<
               })
             : sdk.languageModel(model.api.id)
           s.models.set(key, language)
+          trace.info("语言模型实例创建完成", {
+            providerID: model.providerID,
+            modelID: model.id,
+            apiModelID: model.api.id,
+          })
           return language
         } catch (e) {
           if (e instanceof NoSuchModelError)
@@ -1649,7 +1797,11 @@ const layer: Layer.Layer<
 
     const defaultModel = Effect.fn("Provider.defaultModel")(function* () {
       const cfg = yield* config.get()
-      if (cfg.model) return parseModel(cfg.model)
+      if (cfg.model) {
+        const parsed = parseModel(cfg.model)
+        trace.info("使用配置中的默认模型", parsed)
+        return parsed
+      }
 
       const s = yield* InstanceState.get(state)
       const recent = yield* fs.readJson(path.join(Global.Path.state, "model.json")).pipe(
@@ -1675,6 +1827,10 @@ const layer: Layer.Layer<
       if (!provider) throw new Error("no providers found")
       const [model] = sort(Object.values(provider.models))
       if (!model) throw new Error("no models found")
+      trace.info("自动选择默认模型", {
+        providerID: provider.id,
+        modelID: model.id,
+      })
       return {
         providerID: provider.id,
         modelID: model.id,
@@ -1703,6 +1859,14 @@ export function sort<T extends { id: string }>(models: T[]) {
     [(model) => (model.id.includes("latest") ? 0 : 1), "asc"],
     [(model) => model.id, "desc"],
   )
+}
+
+function safeJson(input: string) {
+  try {
+    return JSON.parse(input)
+  } catch {
+    return input
+  }
 }
 
 export function parseModel(model: string) {

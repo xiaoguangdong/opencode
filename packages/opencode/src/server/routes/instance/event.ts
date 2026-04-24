@@ -2,12 +2,13 @@ import z from "zod"
 import { Hono } from "hono"
 import { describeRoute, resolver } from "hono-openapi"
 import { streamSSE } from "hono/streaming"
-import { Log } from "@/util"
+import { Log, Trace } from "@/util"
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import { AsyncQueue } from "@/util/queue"
 
 const log = Log.create({ service: "server" })
+const trace = Trace.create("server.event", "packages/opencode/src/server/routes/instance/event.ts")
 
 export const EventRoutes = () =>
   new Hono().get(
@@ -33,6 +34,10 @@ export const EventRoutes = () =>
     }),
     async (c) => {
       log.info("event connected")
+      trace.info("TUI/客户端已连接事件流", {
+        method: c.req.method,
+        path: new URL(c.req.url).pathname,
+      })
       c.header("Cache-Control", "no-cache, no-transform")
       c.header("X-Accel-Buffering", "no")
       c.header("X-Content-Type-Options", "nosniff")
@@ -46,6 +51,7 @@ export const EventRoutes = () =>
             properties: {},
           }),
         )
+        trace.info("事件流已发送 server.connected")
 
         // Send heartbeat every 10s to prevent stalled proxy streams.
         const heartbeat = setInterval(() => {
@@ -64,9 +70,14 @@ export const EventRoutes = () =>
           unsub()
           q.push(null)
           log.info("event disconnected")
+          trace.info("TUI/客户端事件流已断开")
         }
 
         const unsub = Bus.subscribeAll((event) => {
+          trace.info("事件流向 TUI/客户端写入 Bus 事件", {
+            type: event.type,
+            properties: event.properties,
+          })
           q.push(JSON.stringify(event))
           if (event.type === Bus.InstanceDisposed.type) {
             stop()

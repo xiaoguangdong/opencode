@@ -22,10 +22,12 @@ import { Auth } from "@/auth"
 import { Installation } from "@/installation"
 import { InstallationVersion } from "@/installation/version"
 import { EffectBridge } from "@/effect"
+import { Trace } from "@/util"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 
 const log = Log.create({ service: "llm" })
+const trace = Trace.create("llm", "packages/opencode/src/session/llm.ts")
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 type Result = Awaited<ReturnType<typeof streamText>>
 
@@ -143,6 +145,25 @@ const live: Layer.Layer<
       if (isOpenaiOauth) {
         options.instructions = system.join("\n")
       }
+      trace.info("LLM 已完成系统提示词和模型参数初步组装", {
+        sessionID: input.sessionID,
+        parentSessionID: input.parentSessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        apiModelID: input.model.api.id,
+        providerPackage: input.model.api.npm,
+        agent: input.agent.name,
+        mode: input.agent.mode,
+        small: input.small ?? false,
+        userMessageID: input.user.id,
+        requestedVariant: input.user.model.variant,
+        effectiveVariant: variant,
+        providerOptions: item.options,
+        modelOptions: input.model.options,
+        agentOptions: input.agent.options,
+        mergedOptions: options,
+        system,
+      })
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
       const messages = isOpenaiOauth
@@ -158,6 +179,15 @@ const live: Layer.Layer<
               ),
               ...input.messages,
             ]
+      trace.info("LLM 最终消息列表已生成", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        isOpenaiOauth,
+        isWorkflow,
+        messageCount: messages.length,
+        messages,
+      })
 
       const params = yield* plugin.trigger(
         "chat.params",
@@ -194,6 +224,28 @@ const live: Layer.Layer<
       )
 
       const tools = resolveTools(input)
+      trace.info("LLM 工具和采样参数已准备", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        temperature: params.temperature,
+        topP: params.topP,
+        topK: params.topK,
+        maxOutputTokens: params.maxOutputTokens,
+        toolChoice: input.toolChoice,
+        activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+        toolDefinitions: Object.fromEntries(
+          Object.entries(tools).map(([name, item]) => [
+            name,
+            {
+              description: item.description,
+              inputSchema: item.inputSchema,
+            },
+          ]),
+        ),
+        headers,
+        paramsOptions: params.options,
+      })
 
       // LiteLLM and some Anthropic proxies require the tools parameter to be present
       // when message history contains tool calls, even if no tools are being used.
@@ -329,10 +381,42 @@ const live: Layer.Layer<
             },
           })
         : undefined
+      const providerOptions = ProviderTransform.providerOptions(input.model, params.options)
+      const requestHeaders = {
+        ...(input.model.providerID.startsWith("opencode")
+          ? {
+              "x-opencode-project": Instance.project.id,
+              "x-opencode-session": input.sessionID,
+              "x-opencode-request": input.user.id,
+              "x-opencode-client": Flag.OPENCODE_CLIENT,
+            }
+          : {
+              "x-session-affinity": input.sessionID,
+              ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
+              "User-Agent": `opencode/${InstallationVersion}`,
+            }),
+        ...input.model.headers,
+        ...headers,
+      }
+      trace.info("LLM 即将调用 AI SDK streamText", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        providerOptions,
+        headers: requestHeaders,
+        maxRetries: input.retries ?? 0,
+        messageCount: messages.length,
+      })
 
       return streamText({
         onError(error) {
           l.error("stream error", {
+            error,
+          })
+          trace.error("LLM 流式请求发生错误", {
+            sessionID: input.sessionID,
+            providerID: input.model.providerID,
+            modelID: input.model.id,
             error,
           })
         },
@@ -360,28 +444,13 @@ const live: Layer.Layer<
         temperature: params.temperature,
         topP: params.topP,
         topK: params.topK,
-        providerOptions: ProviderTransform.providerOptions(input.model, params.options),
+        providerOptions,
         activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
         tools,
         toolChoice: input.toolChoice,
         maxOutputTokens: params.maxOutputTokens,
         abortSignal: input.abort,
-        headers: {
-          ...(input.model.providerID.startsWith("opencode")
-            ? {
-                "x-opencode-project": Instance.project.id,
-                "x-opencode-session": input.sessionID,
-                "x-opencode-request": input.user.id,
-                "x-opencode-client": Flag.OPENCODE_CLIENT,
-              }
-            : {
-                "x-session-affinity": input.sessionID,
-                ...(input.parentSessionID ? { "x-parent-session-id": input.parentSessionID } : {}),
-                "User-Agent": `opencode/${InstallationVersion}`,
-              }),
-          ...input.model.headers,
-          ...headers,
-        },
+        headers: requestHeaders,
         maxRetries: input.retries ?? 0,
         messages,
         model: wrapLanguageModel({
@@ -393,6 +462,13 @@ const live: Layer.Layer<
                 if (args.type === "stream") {
                   // @ts-expect-error
                   args.params.prompt = ProviderTransform.message(args.params.prompt, input.model, options)
+                  trace.info("LLM 已完成 provider 消息转换", {
+                    sessionID: input.sessionID,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                    transformedPrompt: args.params.prompt,
+                    transformOptions: options,
+                  })
                 }
                 return args.params
               },
@@ -422,7 +498,27 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            return Stream.fromAsyncIterable(result.fullStream, (e) => (e instanceof Error ? e : new Error(String(e))))
+            return Stream.fromAsyncIterable(result.fullStream, (e) => (e instanceof Error ? e : new Error(String(e)))).pipe(
+              Stream.tap((event) =>
+                Effect.sync(() => {
+                  if (!trace.enabled()) return
+                  if (event.type === "text-delta") {
+                    trace.info("LLM 收到文本增量", { sessionID: input.sessionID, text: event.text })
+                    return
+                  }
+                  trace.info("LLM 收到流事件", { sessionID: input.sessionID, event })
+                }),
+              ),
+              Stream.ensuring(
+                Effect.sync(() =>
+                  trace.info("LLM 流读取结束", {
+                    sessionID: input.sessionID,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                  }),
+                ),
+              ),
+            )
           }),
         ),
       )

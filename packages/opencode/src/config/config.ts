@@ -1,4 +1,4 @@
-import { Log } from "../util"
+import { Log, Trace } from "../util"
 import path from "path"
 import { pathToFileURL } from "url"
 import os from "os"
@@ -28,6 +28,7 @@ import { zod, ZodOverride } from "@/util/effect-zod"
 import { withStatics } from "@/util/schema"
 import { ConfigAgent } from "./agent"
 import { ConfigCommand } from "./command"
+import { ConfigCodex } from "./codex"
 import { ConfigFormatter } from "./formatter"
 import { ConfigLayout } from "./layout"
 import { ConfigLSP } from "./lsp"
@@ -45,6 +46,7 @@ import { ConfigVariable } from "./variable"
 import { Npm } from "@/npm"
 
 const log = Log.create({ service: "config" })
+const trace = Trace.create("config", "packages/opencode/src/config/config.ts")
 
 // Custom merge function that concatenates array fields instead of replacing them
 function mergeConfigConcatArrays(target: Info, source: Info): Info {
@@ -394,6 +396,7 @@ export const layer = Layer.effect(
         mergeDeep(yield* loadFile(path.join(Global.Path.config, "config.json"))),
         mergeDeep(yield* loadFile(path.join(Global.Path.config, "opencode.json"))),
         mergeDeep(yield* loadFile(path.join(Global.Path.config, "opencode.jsonc"))),
+        mergeDeep(yield* ConfigCodex.loadCodexConfig(fs)),
       )
 
       const legacy = path.join(Global.Path.config, "config")
@@ -690,6 +693,15 @@ export const layer = Layer.effect(
           result.compaction = { ...result.compaction, prune: false }
         }
 
+        trace.info("配置加载完成", {
+          directory: ctx.directory,
+          worktree: ctx.worktree,
+          config: result,
+          directories,
+          consoleManagedProviders: Array.from(consoleManagedProviders),
+          activeOrgName,
+          switchableOrgCount: 0,
+        })
         return {
           config: result,
           directories,
