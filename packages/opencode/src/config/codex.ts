@@ -30,8 +30,16 @@ function wireApiProvider(wireApi: string | undefined) {
   return "@ai-sdk/openai"
 }
 
+function readCodexAuthKey(auth: unknown) {
+  if (typeof auth === "string") return auth
+  if (!auth || typeof auth !== "object") return undefined
+  const value = (auth as Record<string, unknown>)["OPENAI_API_KEY"]
+  return typeof value === "string" && value !== "" ? value : undefined
+}
+
 export function loadCodexConfig(fs: AppFileSystem.Interface): Effect.Effect<Info> {
   const configPath = path.join(os.homedir(), ".codex", "config.toml")
+  const authPath = path.join(os.homedir(), ".codex", "auth.json")
   return Effect.gen(function* () {
     const text = yield* fs.readFileString(configPath).pipe(Effect.catch(() => Effect.succeed(undefined)))
     if (!text) return {}
@@ -44,6 +52,8 @@ export function loadCodexConfig(fs: AppFileSystem.Interface): Effect.Effect<Info
     const baseURL = readString(block, "base_url")
     const wireApi = readString(block, "wire_api")
     const requiresOpenaiAuth = readBool(block, "requires_openai_auth")
+    const codexAuth = yield* fs.readJson(authPath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    const codexApiKey = requiresOpenaiAuth === false ? undefined : readCodexAuthKey(codexAuth)
     const env = requiresOpenaiAuth === false ? [] : ["OPENAI_API_KEY"]
     const result: Info = {
       $schema: "https://opencode.ai/config.json",
@@ -56,6 +66,7 @@ export function loadCodexConfig(fs: AppFileSystem.Interface): Effect.Effect<Info
           env,
           options: {
             ...(baseURL ? { baseURL } : {}),
+            ...(codexApiKey ? { apiKey: codexApiKey } : {}),
             ...(requiresOpenaiAuth === false ? { apiKey: "codex-local" } : {}),
           },
           models: {
@@ -82,6 +93,8 @@ export function loadCodexConfig(fs: AppFileSystem.Interface): Effect.Effect<Info
       baseURL,
       wireApi,
       requiresOpenaiAuth,
+      authPath,
+      authSource: codexApiKey ? ".codex/auth.json" : env.length > 0 ? "environment" : "none",
       generated: result,
     })
     return result

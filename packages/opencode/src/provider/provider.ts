@@ -1574,6 +1574,18 @@ const layer: Layer.Layer<
             headers: Object.fromEntries(res.headers.entries()),
           })
 
+          if (!res.ok) {
+            trace.warn("provider HTTP 请求返回错误状态", {
+              providerID: model.providerID,
+              modelID: model.id,
+              url: String(input),
+              status: res.status,
+              statusText: res.statusText,
+              headers: Object.fromEntries(res.headers.entries()),
+              body: safeJson(await res.clone().text()),
+            })
+          }
+
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
         }

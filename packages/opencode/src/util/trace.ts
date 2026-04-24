@@ -1,6 +1,7 @@
 import * as Log from "./log"
 
-const secretPattern = /(api[_-]?key|authorization|bearer|token|secret|password|credential|cookie|set-cookie|access|refresh)/i
+const secretPattern =
+  /(api[_-]?key|authorization|bearer|token|secret|password|credential|cookie|set-cookie|access|refresh|encrypted|cipher|signature)/i
 const maxString = Number(process.env.OPENCODE_TRACE_MAX_STRING ?? 20000)
 const maxArray = Number(process.env.OPENCODE_TRACE_MAX_ARRAY ?? 200)
 const maxDepth = Number(process.env.OPENCODE_TRACE_MAX_DEPTH ?? 8)
