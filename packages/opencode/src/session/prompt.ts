@@ -3,7 +3,7 @@ import os from "os"
 import z from "zod"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
-import { Log } from "../util"
+import { FlowLog, Log } from "../util"
 import { SessionRevert } from "./revert"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
@@ -67,6 +67,15 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 const log = Log.create({ service: "session.prompt" })
 const elog = EffectLogger.create({ service: "session.prompt" })
 const trace = Trace.create("session", "packages/opencode/src/session/prompt.ts")
+
+function summarizeParts(parts: Array<{ type: string; text?: string; filename?: string; mime?: string; name?: string }>) {
+  return parts.map((part) => {
+    if (part.type === "text") return { type: part.type, text: part.text }
+    if (part.type === "file") return { type: part.type, filename: part.filename, mime: part.mime }
+    if (part.type === "agent") return { type: part.type, name: part.name }
+    return part
+  })
+}
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -430,6 +439,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   args,
                   source: "builtin",
                 })
+                FlowLog.write("工具开始执行", {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.messageID,
+                  callID: ctx.callID,
+                  tool: item.id,
+                  source: "builtin",
+                  args,
+                })
                 yield* plugin.trigger(
                   "tool.execute.before",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
@@ -451,6 +468,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   output,
                 )
                 trace.info("工具执行完成", {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.messageID,
+                  callID: ctx.callID,
+                  tool: item.id,
+                  source: "builtin",
+                  output,
+                })
+                FlowLog.write("工具执行完成", {
                   sessionID: ctx.sessionID,
                   messageID: ctx.messageID,
                   callID: ctx.callID,
@@ -486,6 +511,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 tool: key,
                 args,
                 source: "mcp",
+              })
+              FlowLog.write("工具开始执行", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.messageID,
+                callID: ctx.callID,
+                tool: key,
+                source: "mcp",
+                args,
               })
               yield* plugin.trigger(
                 "tool.execute.before",
@@ -549,6 +582,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 yield* input.processor.completeToolCall(opts.toolCallId, output)
               }
               trace.info("工具执行完成", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.messageID,
+                callID: ctx.callID,
+                tool: key,
+                source: "mcp",
+                output,
+              })
+              FlowLog.write("工具执行完成", {
                 sessionID: ctx.sessionID,
                 messageID: ctx.messageID,
                 callID: ctx.callID,
@@ -1013,6 +1054,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         partCount: input.parts.length,
         rawParts: input.parts,
       })
+      FlowLog.write("用户输入已解析", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        agent: ag.name,
+        model: info.model,
+        format: input.format,
+        parts: summarizeParts(input.parts),
+      })
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
 
@@ -1338,6 +1387,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         resolvedPartCount: parts.length,
         resolvedParts: parts,
       })
+      FlowLog.write("用户消息已写入会话存储", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        agent: info.agent,
+        model: info.model,
+        parts: summarizeParts(parts),
+      })
 
       return { info, parts }
     }, Effect.scoped)
@@ -1353,6 +1409,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           noReply: input.noReply,
           partCount: input.parts.length,
           parts: input.parts,
+        })
+        FlowLog.write("收到用户 prompt", {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          agent: input.agent,
+          model: input.model,
+          variant: input.variant,
+          noReply: input.noReply,
+          parts: summarizeParts(input.parts),
         })
         const session = yield* sessions.get(input.sessionID)
         yield* revert.cleanup(session)
@@ -1403,6 +1468,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           yield* status.set(sessionID, { type: "busy" })
           yield* slog.info("loop", { step })
           trace.info("会话循环开始新一轮", { sessionID, step })
+          FlowLog.write("会话循环开始", { sessionID, step })
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
@@ -1474,6 +1540,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               options: model.options,
               headers: model.headers,
               variants: model.variants,
+            },
+          })
+          FlowLog.write("会话循环已解析模型", {
+            sessionID,
+            step,
+            requestedModel: lastUser.model,
+            resolvedModel: {
+              id: model.id,
+              providerID: model.providerID,
+              api: model.api,
+              limit: model.limit,
+              options: model.options,
+              headers: model.headers,
             },
           })
           const task = tasks.pop()
@@ -1564,6 +1643,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               isLastStep,
               maxSteps,
             })
+            FlowLog.write("准备调用 LLM", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              userMessageID: lastUser.id,
+              agent: agent.name,
+              model: `${model.providerID}/${model.id}`,
+              toolCount: Object.keys(tools).length,
+              tools: Object.keys(tools),
+              isLastStep,
+              maxSteps,
+            })
 
             if (lastUser.format?.type === "json_schema") {
               tools["StructuredOutput"] = createStructuredOutputTool({
@@ -1614,6 +1705,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               system,
               modelMessages: modelMsgs,
             })
+            FlowLog.write("LLM 输入已生成", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              format,
+              systemCount: system.length,
+              modelMessageCount: modelMsgs.length,
+              modelMessages: modelMsgs,
+            })
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1627,6 +1727,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
             trace.info("LLM 处理器返回结果", {
+              sessionID,
+              step,
+              assistantMessageID: msg.id,
+              result,
+              finish: handle.message.finish,
+              error: handle.message.error,
+              tokens: handle.message.tokens,
+              cost: handle.message.cost,
+            })
+            FlowLog.write("LLM 处理器返回", {
               sessionID,
               step,
               assistantMessageID: msg.id,

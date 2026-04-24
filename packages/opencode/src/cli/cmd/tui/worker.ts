@@ -1,6 +1,6 @@
 import { Installation } from "@/installation"
 import { Server } from "@/server/server"
-import { Log } from "@/util"
+import { FlowLog, Log } from "@/util"
 import { Instance } from "@/project/instance"
 import { InstanceBootstrap } from "@/project/bootstrap"
 import { Rpc } from "@/util"
@@ -12,8 +12,15 @@ import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
 import { ensureProcessMetadata } from "@/util/opencode-process"
+import { Global } from "@/global"
+import fs from "fs/promises"
 
-ensureProcessMetadata("worker")
+const processMetadata = ensureProcessMetadata("worker")
+
+if (process.env.OPENCODE_LOG_DIR) {
+  Global.Path.log = process.env.OPENCODE_LOG_DIR
+  await fs.mkdir(Global.Path.log, { recursive: true })
+}
 
 await Log.init({
   print: process.argv.includes("--print-logs"),
@@ -22,6 +29,20 @@ await Log.init({
     if (Installation.isLocal()) return "DEBUG"
     return "INFO"
   })(),
+})
+await FlowLog.init(processMetadata.runID, processMetadata.processRole)
+Log.Default.info("worker started", {
+  process_role: processMetadata.processRole,
+  run_id: processMetadata.runID,
+  log_path: Log.file(),
+  flow_log_path: FlowLog.file(),
+})
+FlowLog.write("TUI worker 启动", {
+  processRole: processMetadata.processRole,
+  runID: processMetadata.runID,
+  logPath: Log.file(),
+  flowLogPath: FlowLog.file(),
+  cwd: process.cwd(),
 })
 
 Heap.start()

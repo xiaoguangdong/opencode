@@ -18,7 +18,7 @@ import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
-import { Log } from "@/util"
+import { FlowLog, Log } from "@/util"
 import { isRecord } from "@/util/record"
 
 const DOOM_LOOP_THRESHOLD = 3
@@ -179,6 +179,13 @@ export const layer: Layer.Layer<
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
+        FlowLog.write("工具结果写入会话", {
+          sessionID: ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+          callID: toolCallID,
+          tool: match.part.tool,
+          output,
+        })
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -197,6 +204,13 @@ export const layer: Layer.Layer<
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return false
+        FlowLog.write("工具执行失败", {
+          sessionID: ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+          callID: toolCallID,
+          tool: match.part.tool,
+          error: errorMessage(error),
+        })
         yield* session.updatePart({
           ...match.part,
           state: {
@@ -217,6 +231,10 @@ export const layer: Layer.Layer<
         switch (value.type) {
           case "start":
             yield* status.set(ctx.sessionID, { type: "busy" })
+            FlowLog.write("LLM processor 收到 start", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+            })
             return
 
           case "reasoning-start":
@@ -260,6 +278,13 @@ export const layer: Layer.Layer<
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.toolName}`)
             }
+            FlowLog.write("模型开始组织工具输入", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              callID: value.id,
+              tool: value.toolName,
+              providerExecuted: value.providerExecuted,
+            })
             const part = yield* session.updatePart({
               id: ctx.toolcalls[value.id]?.partID ?? PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -301,6 +326,14 @@ export const layer: Layer.Layer<
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+            FlowLog.write("模型发起工具调用", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              callID: value.toolCallId,
+              tool: value.toolName,
+              input: value.input,
+              providerMetadata: value.providerMetadata,
+            })
 
             const parts = MessageV2.parts(ctx.assistantMessage.id)
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
@@ -360,6 +393,13 @@ export const layer: Layer.Layer<
               usage: value.usage,
               metadata: value.providerMetadata,
             })
+            FlowLog.write("模型 step 完成", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              finishReason: value.finishReason,
+              usage,
+              providerMetadata: value.providerMetadata,
+            })
             ctx.assistantMessage.finish = value.finishReason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
@@ -404,6 +444,11 @@ export const layer: Layer.Layer<
           }
 
           case "text-start":
+            FlowLog.write("模型开始输出文本", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              providerMetadata: value.providerMetadata,
+            })
             ctx.currentText = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -448,10 +493,21 @@ export const layer: Layer.Layer<
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePart(ctx.currentText)
+            FlowLog.write("模型文本输出完成", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              text: ctx.currentText.text,
+              providerMetadata: value.providerMetadata,
+            })
             ctx.currentText = undefined
             return
 
           case "finish":
+            FlowLog.write("模型流 finish", {
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              event: value,
+            })
             return
 
           default:
@@ -522,6 +578,12 @@ export const layer: Layer.Layer<
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
+        FlowLog.write("LLM processor 异常停止", {
+          sessionID: ctx.sessionID,
+          assistantMessageID: ctx.assistantMessage.id,
+          error: errorMessage(e),
+          stack: e instanceof Error ? e.stack : undefined,
+        })
         const error = parse(e)
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true

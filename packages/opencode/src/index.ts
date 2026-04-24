@@ -3,6 +3,7 @@ import { hideBin } from "yargs/helpers"
 import { RunCommand } from "./cli/cmd/run"
 import { GenerateCommand } from "./cli/cmd/generate"
 import { Log } from "./util"
+import { FlowLog } from "./util"
 import { ConsoleCommand } from "./cli/cmd/account"
 import { ProvidersCommand } from "./cli/cmd/providers"
 import { AgentCommand } from "./cli/cmd/agent"
@@ -99,6 +100,7 @@ const cli = yargs(args)
     if (debugDefault) process.env.OPENCODE_DEBUG_DEFAULT = "1"
     if (debugDefault) {
       Global.Path.log = path.join(process.cwd(), ".opencode", "logs")
+      process.env.OPENCODE_LOG_DIR = Global.Path.log
       await fs.mkdir(Global.Path.log, { recursive: true })
     }
     await Log.init({
@@ -111,6 +113,7 @@ const cli = yargs(args)
         return "INFO"
       })(),
     })
+    await FlowLog.init(processMetadata.runID, processMetadata.processRole)
 
     Heap.start()
 
@@ -124,6 +127,16 @@ const cli = yargs(args)
       process_role: processMetadata.processRole,
       run_id: processMetadata.runID,
       log_path: Log.file(),
+      flow_log_path: FlowLog.file(),
+    })
+    FlowLog.write("进程启动", {
+      version: InstallationVersion,
+      args: process.argv.slice(2),
+      processRole: processMetadata.processRole,
+      runID: processMetadata.runID,
+      logPath: Log.file(),
+      flowLogPath: FlowLog.file(),
+      cwd: process.cwd(),
     })
 
     const marker = path.join(Global.Path.data, "opencode.db")

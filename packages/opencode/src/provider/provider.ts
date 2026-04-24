@@ -26,7 +26,7 @@ import { InstanceState } from "@/effect"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { isRecord } from "@/util/record"
 import { withStatics } from "@/util/schema"
-import { Trace } from "@/util"
+import { FlowLog, Trace } from "@/util"
 
 import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
@@ -1560,6 +1560,18 @@ const layer: Layer.Layer<
             timeout: options["timeout"],
             chunkTimeout,
           })
+          FlowLog.write("provider HTTP 请求发出", {
+            providerID: model.providerID,
+            modelID: model.id,
+            apiModelID: model.api.id,
+            providerPackage: model.api.npm,
+            url: String(input),
+            method: opts.method,
+            headers: opts.headers,
+            body: typeof opts.body === "string" ? safeJson(opts.body) : opts.body,
+            timeout: options["timeout"],
+            chunkTimeout,
+          })
           const res = await fetchFn(input, {
             ...opts,
             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
@@ -1573,8 +1585,17 @@ const layer: Layer.Layer<
             statusText: res.statusText,
             headers: Object.fromEntries(res.headers.entries()),
           })
+          FlowLog.write("provider HTTP 请求返回", {
+            providerID: model.providerID,
+            modelID: model.id,
+            url: String(input),
+            status: res.status,
+            statusText: res.statusText,
+            headers: Object.fromEntries(res.headers.entries()),
+          })
 
           if (!res.ok) {
+            const body = safeJson(await res.clone().text())
             trace.warn("provider HTTP 请求返回错误状态", {
               providerID: model.providerID,
               modelID: model.id,
@@ -1582,7 +1603,16 @@ const layer: Layer.Layer<
               status: res.status,
               statusText: res.statusText,
               headers: Object.fromEntries(res.headers.entries()),
-              body: safeJson(await res.clone().text()),
+              body,
+            })
+            FlowLog.write("provider HTTP 请求错误", {
+              providerID: model.providerID,
+              modelID: model.id,
+              url: String(input),
+              status: res.status,
+              statusText: res.statusText,
+              headers: Object.fromEntries(res.headers.entries()),
+              body,
             })
           }
 

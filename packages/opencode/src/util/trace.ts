@@ -1,10 +1,11 @@
 import * as Log from "./log"
+import { inspect } from "util"
 
 const secretPattern =
   /(api[_-]?key|authorization|bearer|token|secret|password|credential|cookie|set-cookie|access|refresh|encrypted|cipher|signature)/i
 const maxString = Number(process.env.OPENCODE_TRACE_MAX_STRING ?? 20000)
 const maxArray = Number(process.env.OPENCODE_TRACE_MAX_ARRAY ?? 200)
-const maxDepth = Number(process.env.OPENCODE_TRACE_MAX_DEPTH ?? 8)
+const maxDepth = Number(process.env.OPENCODE_TRACE_MAX_DEPTH ?? 32)
 const cwd = process.cwd()
 
 function on(value: string | undefined) {
@@ -29,6 +30,14 @@ function limitString(input: string) {
   return input.slice(0, maxString) + `...[已截断，原始长度=${input.length}]`
 }
 
+function depthPreview(value: unknown) {
+  if (scrubSecrets()) return "[超过最大深度，OPENCODE_TRACE_SCRUB=1 时不展开深层预览]"
+  const rendered = inspect(value, { depth: 4, maxArrayLength: 50, breakLength: 160, compact: true })
+  return `[超过最大深度，预览前1000字符] ${rendered.slice(0, 1000)}${
+    rendered.length > 1000 ? `...[预览已截断，原始长度=${rendered.length}]` : ""
+  }`
+}
+
 function scrub(value: unknown, depth: number, seen: WeakSet<object>, key?: string): unknown {
   if (scrubSecrets() && key && secretPattern.test(key)) {
     if (value === undefined || value === null || value === "") return value
@@ -51,7 +60,7 @@ function scrub(value: unknown, depth: number, seen: WeakSet<object>, key?: strin
   if (typeof value === "function") return `[函数:${value.name || "anonymous"}]`
   if (typeof value !== "object") return String(value)
   if (seen.has(value)) return "[循环引用]"
-  if (depth >= maxDepth) return "[超过最大深度]"
+  if (depth >= (on(process.env.OPENCODE_TRACE_FULL) ? 100 : maxDepth)) return depthPreview(value)
   seen.add(value)
   if (Array.isArray(value)) {
     const items = on(process.env.OPENCODE_TRACE_FULL) ? value : value.slice(0, maxArray)

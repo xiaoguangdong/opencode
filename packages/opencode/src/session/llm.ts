@@ -1,5 +1,5 @@
 import { Provider } from "@/provider"
-import { Log } from "@/util"
+import { FlowLog, Log } from "@/util"
 import { Context, Effect, Layer, Record } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool, tool, jsonSchema } from "ai"
@@ -164,6 +164,22 @@ const live: Layer.Layer<
         mergedOptions: options,
         system,
       })
+      FlowLog.write("LLM 参数已组装", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        apiModelID: input.model.api.id,
+        providerPackage: input.model.api.npm,
+        agent: input.agent.name,
+        small: input.small ?? false,
+        userMessageID: input.user.id,
+        requestedVariant: input.user.model.variant,
+        providerOptions: item.options,
+        modelOptions: input.model.options,
+        agentOptions: input.agent.options,
+        mergedOptions: options,
+        systemCount: system.length,
+      })
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
       const messages = isOpenaiOauth
@@ -180,6 +196,15 @@ const live: Layer.Layer<
               ...input.messages,
             ]
       trace.info("LLM 最终消息列表已生成", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        isOpenaiOauth,
+        isWorkflow,
+        messageCount: messages.length,
+        messages,
+      })
+      FlowLog.write("LLM 最终消息列表已生成", {
         sessionID: input.sessionID,
         providerID: input.model.providerID,
         modelID: input.model.id,
@@ -407,6 +432,15 @@ const live: Layer.Layer<
         maxRetries: input.retries ?? 0,
         messageCount: messages.length,
       })
+      FlowLog.write("即将调用 AI SDK streamText", {
+        sessionID: input.sessionID,
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        providerOptions,
+        headers: requestHeaders,
+        maxRetries: input.retries ?? 0,
+        messageCount: messages.length,
+      })
 
       return streamText({
         onError(error) {
@@ -414,6 +448,12 @@ const live: Layer.Layer<
             error,
           })
           trace.error("LLM 流式请求发生错误", {
+            sessionID: input.sessionID,
+            providerID: input.model.providerID,
+            modelID: input.model.id,
+            error,
+          })
+          FlowLog.write("LLM 流式请求发生错误", {
             sessionID: input.sessionID,
             providerID: input.model.providerID,
             modelID: input.model.id,
@@ -469,6 +509,13 @@ const live: Layer.Layer<
                     transformedPrompt: args.params.prompt,
                     transformOptions: options,
                   })
+                  FlowLog.write("LLM provider 消息转换完成", {
+                    sessionID: input.sessionID,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                    transformedPrompt: args.params.prompt,
+                    transformOptions: options,
+                  })
                 }
                 return args.params
               },
@@ -504,19 +551,34 @@ const live: Layer.Layer<
                   if (!trace.enabled()) return
                   if (event.type === "text-delta") {
                     trace.info("LLM 收到文本增量", { sessionID: input.sessionID, text: event.text })
+                    FlowLog.write("LLM 文本增量", { sessionID: input.sessionID, text: event.text })
                     return
                   }
                   trace.info("LLM 收到流事件", { sessionID: input.sessionID, event })
+                  if (
+                    event.type === "tool-call" ||
+                    event.type === "tool-result" ||
+                    event.type === "tool-error" ||
+                    event.type === "finish-step" ||
+                    event.type === "finish"
+                  ) {
+                    FlowLog.write("LLM 流事件", { sessionID: input.sessionID, event })
+                  }
                 }),
               ),
               Stream.ensuring(
-                Effect.sync(() =>
+                Effect.sync(() => {
                   trace.info("LLM 流读取结束", {
                     sessionID: input.sessionID,
                     providerID: input.model.providerID,
                     modelID: input.model.id,
-                  }),
-                ),
+                  })
+                  FlowLog.write("LLM 流读取结束", {
+                    sessionID: input.sessionID,
+                    providerID: input.model.providerID,
+                    modelID: input.model.id,
+                  })
+                }),
               ),
             )
           }),

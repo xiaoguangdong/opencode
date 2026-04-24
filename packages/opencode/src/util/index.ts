@@ -1,6 +1,7 @@
 export * as Archive from "./archive"
 export * as Color from "./color"
 export * as Filesystem from "./filesystem"
+export * as FlowLog from "./flow-log"
 export * as Keybind from "./keybind"
 export * as LocalContext from "./local-context"
 export * as Locale from "./locale"

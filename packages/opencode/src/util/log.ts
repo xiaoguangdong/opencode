@@ -4,6 +4,7 @@ import { createWriteStream } from "fs"
 import { Global } from "../global"
 import z from "zod"
 import { Glob } from "@opencode-ai/shared/util/glob"
+import { ensureProcessMetadata } from "./opencode-process"
 
 export const Level = z.enum(["DEBUG", "INFO", "WARN", "ERROR"]).meta({ ref: "LogLevel", description: "Log level" })
 export type Level = z.infer<typeof Level>
@@ -52,6 +53,26 @@ let logpath = ""
 export function file() {
   return logpath
 }
+function pad(input: number) {
+  return input.toString().padStart(2, "0")
+}
+export function timestamp(date = new Date()) {
+  const offset = -date.getTimezoneOffset()
+  const sign = offset >= 0 ? "+" : "-"
+  const abs = Math.abs(offset)
+  return [
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    "T",
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`,
+    sign,
+    pad(Math.floor(abs / 60)),
+    ":",
+    pad(abs % 60),
+  ].join("")
+}
+function timestampFilename(date = new Date()) {
+  return timestamp(date).replace(/:/g, "")
+}
 let write = (msg: any) => {
   process.stderr.write(msg)
   return msg.length
@@ -63,7 +84,13 @@ export async function init(options: Options) {
   if (options.print) return
   logpath = path.join(
     Global.Path.log,
-    options.dev ? "dev.log" : new Date().toISOString().split(".")[0].replace(/:/g, "") + ".log",
+    options.dev
+      ? "dev.log"
+      : [
+          timestampFilename(),
+          ensureProcessMetadata("main").processRole,
+          process.pid,
+        ].join("-") + ".log",
   )
   await fs.truncate(logpath).catch(() => {})
   const stream = createWriteStream(logpath, { flags: "a" })
@@ -79,13 +106,13 @@ export async function init(options: Options) {
 
 async function cleanup(dir: string) {
   const files = (
-    await Glob.scan("????-??-??T??????.log", {
+    await Glob.scan("????-??-??T??????*.log", {
       cwd: dir,
       absolute: false,
       include: "file",
     }).catch(() => [])
   )
-    .filter((file) => path.basename(file) === file)
+    .filter((file) => path.basename(file) === file && !file.startsWith("flow-"))
     .sort()
   if (files.length <= keep) return
 
@@ -128,7 +155,7 @@ export function create(tags?: Record<string, any>) {
     const next = new Date()
     const diff = next.getTime() - last
     last = next.getTime()
-    return [next.toISOString().split(".")[0], "+" + diff + "ms", prefix, message].filter(Boolean).join(" ") + "\n"
+    return [timestamp(next), "+" + diff + "ms", prefix, message].filter(Boolean).join(" ") + "\n"
   }
   const result: Logger = {
     debug(message?: any, extra?: Record<string, any>) {
