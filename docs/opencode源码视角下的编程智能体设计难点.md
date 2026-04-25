@@ -821,7 +821,18 @@ type LoopState = {
 
 ### 为什么难
 
-编程智能体的上下文来源很多：
+普通聊天 demo 常见写法是：
+
+```ts
+const prompt = [
+  systemPrompt,
+  previousMessages.join("\n"),
+  userPrompt,
+].join("\n\n")
+const answer = await model.chat(prompt)
+```
+
+这在编程智能体里很快会坏。因为代码助手的上下文不是一段文本，而是一组来源不同、可信度不同、生命周期不同、成本不同的事实。它至少包括：
 
 - 用户消息
 - 历史 assistant/tool parts
@@ -833,14 +844,49 @@ type LoopState = {
 - 工具结果
 - compaction summary
 - subtask result
+- provider/model 能力
+- 图片、PDF、目录、文本文件
+- synthetic reminder
+- 结构化输出约束
 
 上下文太少，模型会瞎猜；上下文太多，会超限或成本爆炸。
 
+更麻烦的是，这些事实不能随便排序。比如：
+
+- 环境信息应该比历史消息更稳定，适合放 system。
+- 用户最新消息必须比旧 assistant 回复更重要。
+- 工具结果必须跟 tool call 对上，否则 provider 会报协议错误。
+- 被压缩的旧历史不能继续原样出现，否则压缩没有意义。
+- 大图片在 compaction 时可能要降级成占位文本，否则永远压不动。
+- 旧工具输出可以清理正文，但要保留“曾经有这个工具结果”的结构痕迹。
+
+所以“上下文管理”不是拼字符串，而是一个事实治理系统：采集、分层、排序、转换、压缩、裁剪、注入、重放。
+
 ### opencode 源码落点
 
-在 `session/prompt.ts`，进入 LLM 前组装：
+在 `session/prompt.ts`，进入 LLM 前会做四件事：
 
 ```ts
+if (step > 1 && lastFinished) {
+  for (const m of msgs) {
+    if (m.info.role !== "user" || m.info.id <= lastFinished.id) continue
+    for (const p of m.parts) {
+      if (p.type !== "text" || p.ignored || p.synthetic) continue
+      if (!p.text.trim()) continue
+      p.text = [
+        "<system-reminder>",
+        "The user sent the following message:",
+        p.text,
+        "",
+        "Please address this message and continue with your tasks.",
+        "</system-reminder>",
+      ].join("\n")
+    }
+  }
+}
+
+yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
 const [skills, env, instructions, modelMsgs] = yield* Effect.all([
   sys.skills(agent),
   Effect.sync(() => sys.environment(model)),
@@ -850,12 +896,49 @@ const [skills, env, instructions, modelMsgs] = yield* Effect.all([
 const system = [...env, ...(skills ? [skills] : []), ...instructions]
 ```
 
+这段代码说明上下文不是一个来源：
+
+| 来源 | 代码入口 | 放到哪里 |
+| --- | --- | --- |
+| 运行环境 | `sys.environment(model)` | system |
+| skill 列表 | `sys.skills(agent)` | system |
+| 项目/用户指令 | `instruction.system()` | system |
+| 会话历史 | `MessageV2.toModelMessagesEffect(msgs, model)` | model messages |
+| 插件改写 | `experimental.chat.messages.transform` | 进入 provider 前的 messages |
+| 多轮提醒 | `<system-reminder>` 注入 user text part | model messages |
+
+真正调用 processor 时再组合：
+
+```ts
+const result = yield* handle.process({
+  user: lastUser,
+  agent,
+  permission: session.permission,
+  sessionID,
+  system,
+  messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
+  tools,
+  model,
+})
+```
+
+也就是说，opencode 把“稳定规则”和“对话事实”分开传：
+
+- `system` 承载环境、skill、instructions、结构化输出约束。
+- `messages` 承载用户、assistant、工具结果、文件、压缩摘要。
+- `tools` 承载当前轮可调用能力。
+- `permission` 承载工具执行边界。
+
+### 系统环境不是聊天内容
+
 系统环境在 `session/system.ts`：
 
 ```ts
 environment(model) {
+  const project = Instance.project
   return [[
-    `You are powered by the model named ${model.api.id}.`,
+    `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
+    `Here is some useful information about the environment you are running in:`,
     `<env>`,
     `  Working directory: ${Instance.directory}`,
     `  Workspace root folder: ${Instance.worktree}`,
@@ -867,30 +950,438 @@ environment(model) {
 }
 ```
 
-### 讲透
+这些信息不能混进用户消息里。原因是它们不是用户意图，而是 runtime 事实。如果把它们拼进 user prompt，模型可能把它们当成用户要求的一部分；放 system 里则更像“运行约束”。
 
-opencode 没有把所有东西塞进一个超长 system prompt。它把上下文分成：
+### Skill 不是一次性全加载
 
-- `env`: 当前运行环境
-- `skills`: 可加载技能说明
-- `instructions`: 项目/用户指令
-- `modelMsgs`: 从 MessageV2 转成 provider 可理解的消息
+`sys.skills(agent)` 只放 skill 列表和描述：
 
-这种分层让后续调试更清晰：如果模型行为异常，可以分别检查环境、skill、指令和历史消息。
+```ts
+skills(agent) {
+  if (Permission.disabled(["skill"], agent.permission).has("skill")) return
+  const list = yield* skill.available(agent)
+  return [
+    "Skills provide specialized instructions and workflows for specific tasks.",
+    "Use the skill tool to load a skill when a task matches its description.",
+    Skill.fmt(list, { verbose: true }),
+  ].join("\n")
+}
+```
+
+这里的设计很重要：system 里放“有哪些 skill、什么时候用”，而不是把每个 skill 全文都塞进去。真正需要时再让模型调用 `skill` 工具加载完整内容。这样可以避免两个问题：
+
+- 上下文启动成本过高。
+- 不相关 skill 干扰当前任务。
+
+### MessageV2 才是上下文主干
+
+会话历史不是字符串数组，而是 `MessageV2.WithParts[]`。每条消息有 `info` 和 `parts`：
+
+```ts
+type WithParts = {
+  info: User | Assistant
+  parts: Part[]
+}
+
+type Part =
+  | TextPart
+  | FilePart
+  | ToolPart
+  | ReasoningPart
+  | SubtaskPart
+  | CompactionPart
+  | PatchPart
+  | SnapshotPart
+  | AgentPart
+```
+
+这就是为什么“上下文不是拼字符串”。因为不同 part 有不同语义：
+
+| part | 进入模型时的语义 | 为什么不能简单拼接 |
+| --- | --- | --- |
+| `text` | 用户/assistant 文本 | 需要保留 role 和 ignored/synthetic 标记 |
+| `file` | 附件或文件 | 可能是媒体、普通文本、目录，不同 provider 支持不同 |
+| `tool` | tool call + tool result | 必须和 toolCallId 对齐，不能只是文本 |
+| `reasoning` | 模型推理片段 | 需要 provider metadata 和兼容处理 |
+| `subtask` | 子任务入口/结果 | 需要触发 runtime 调度 |
+| `compaction` | 压缩请求/摘要锚点 | 需要改变历史可见范围 |
+| `patch/snapshot` | 文件变更事实 | 需要用于 UI、恢复、diff，而不一定全量喂模型 |
+
+### part 到 provider message 的转换
+
+`MessageV2.toModelMessagesEffect(msgs, model)` 做真正的转换。用户消息里：
+
+```ts
+if (msg.info.role === "user") {
+  const userMessage: UIMessage = { id: msg.info.id, role: "user", parts: [] }
+  result.push(userMessage)
+  for (const part of msg.parts) {
+    if (part.type === "text" && !part.ignored) {
+      userMessage.parts.push({ type: "text", text: part.text })
+    }
+    if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
+      if (options?.stripMedia && isMedia(part.mime)) {
+        userMessage.parts.push({ type: "text", text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` })
+      } else {
+        userMessage.parts.push({ type: "file", url: part.url, mediaType: part.mime, filename: part.filename })
+      }
+    }
+    if (part.type === "compaction") {
+      userMessage.parts.push({ type: "text", text: "What did we do so far?" })
+    }
+  }
+}
+```
+
+这段逻辑体现了几个上下文治理规则：
+
+- `ignored` 文本不进模型。
+- `text/plain` 和目录文件已经在别处转成文本，因此这里跳过 file part。
+- compaction part 会变成“到目前为止做了什么”的压缩请求。
+- `stripMedia` 时媒体文件降级成占位文本，避免压缩模型被大媒体拖死。
+
+assistant 消息里，tool part 会被转成 provider 能理解的 tool output：
+
+```ts
+if (part.type === "tool" && part.state.status === "completed") {
+  const outputText = part.state.time.compacted
+    ? "[Old tool result content cleared]"
+    : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+
+  assistantMessage.parts.push({
+    type: ("tool-" + part.tool) as `tool-${string}`,
+    state: "output-available",
+    toolCallId: part.callID,
+    input: part.state.input,
+    output: outputText,
+  })
+}
+```
+
+这说明工具结果不是“追加一段 stdout 文本”。它必须保留：
+
+- tool 名称
+- toolCallId
+- 输入参数
+- 输出或错误
+- 是否 providerExecuted
+- provider metadata
+
+否则下一轮模型无法把工具结果和上一轮 tool call 对起来。
+
+### 一个具体例子
+
+假设用户说：
+
+```text
+opencode_debug 启动后日志只显示启动，后续 prompt/LLM/tool 流程看不到。帮我修一下，并打包安装。
+```
+
+几轮后，上下文可能长成这样：
+
+```text
+system:
+  env: 当前目录、git repo、平台、日期、模型
+  skills: 可用 skill 列表
+  instructions: AGENTS.md / 用户指令 / agent prompt
+
+messages:
+  user:
+    text: 修日志并打包安装
+  assistant:
+    text: 我先检查日志模块
+    tool: grep(input="FlowLog|trace.info", output="packages/opencode/src/...")
+    tool: read(input="packages/opencode/src/session/prompt.ts", output="...")
+  assistant:
+    tool: edit(input=..., output="Success. Updated...")
+    tool: bash(input="bun typecheck", output="...")
+  user:
+    text: 对了，日志时间时区不对
+  assistant:
+    text: 我会修正时间格式...
+```
+
+如果你把这些简单拼成一段文本，会丢掉三个关键关系：
+
+1. 哪些是 system 约束，哪些是用户目标。
+2. 哪个工具输出对应哪个 tool call。
+3. 哪些历史已经被 compaction 替代，哪些最近 turns 必须保留原文。
+
+opencode 的做法是保留结构，直到最后一刻再转换成 provider message。
+
+### 压缩不是摘要一下，而是选择 head 和 tail
+
+上下文压缩的核心在 `session/compaction.ts`。它不是把整段历史粗暴总结，而是先选择哪些历史进入 summary，哪些最近历史保留原文：
+
+```ts
+const limit = input.cfg.compaction?.tail_turns ?? DEFAULT_TAIL_TURNS
+const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
+const all = turns(input.messages)
+const recent = all.slice(-limit)
+```
+
+默认策略是：
+
+- 最近若干 turn 尽量保留原文。
+- 更早的 head 进入 summary。
+- 如果最近 turn 太大，就尝试从 turn 中间切出 tail。
+- 如果没有可保留 tail，就全部走 summary。
+
+`preserveRecentBudget` 还会按模型上下文窗口分配近期保留预算：
+
+```ts
+return (
+  input.cfg.compaction?.preserve_recent_tokens ??
+  Math.min(MAX_PRESERVE_RECENT_TOKENS, Math.max(MIN_PRESERVE_RECENT_TOKENS, Math.floor(usable(input) * 0.25)))
+)
+```
+
+这就是“排序”的含义：不是所有历史平等。最近 turn 的操作、错误和用户修正，通常比很早之前的寒暄更重要。
+
+### 压缩摘要也有固定结构
+
+opencode 的 summary prompt 要求固定 Markdown 结构：
+
+```text
+## Goal
+## Constraints & Preferences
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Next Steps
+## Critical Context
+## Relevant Files
+```
+
+这比“总结一下对话”可靠，因为编程任务最怕丢：
+
+- 用户约束
+- 已做改动
+- 未完成事项
+- 关键错误
+- 文件路径
+- 下一步
+
+好的 compaction 不是压缩成短文，而是把可继续工作的状态压缩成结构化交接单。
+
+### 旧工具输出会被清理，但结构还在
+
+`compaction.prune` 会回头扫描旧工具结果：
+
+```ts
+if (part.type !== "tool") continue
+if (part.state.status !== "completed") continue
+if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
+if (part.state.time.compacted) break loop
+const estimate = Token.estimate(part.state.output)
+...
+part.state.time.compacted = Date.now()
+yield* session.updatePart(part)
+```
+
+之后 `toModelMessagesEffect` 会把旧工具输出替换成：
+
+```ts
+"[Old tool result content cleared]"
+```
+
+这点非常关键：它没有删除 tool part，也没有假装工具没发生过。它只是清理高成本输出正文，保留工具调用结构。这样模型还能知道“曾经跑过这个工具”，但不会反复携带几万字符输出。
+
+### 已完成 compaction 如何影响可见历史
+
+`MessageV2.filterCompactedEffect(sessionID)` 会过滤已被压缩的旧历史：
+
+```ts
+export function filterCompacted(msgs: Iterable<WithParts>) {
+  const result = [] as WithParts[]
+  const completed = new Set<string>()
+  let retain: MessageID | undefined
+  for (const msg of msgs) {
+    result.push(msg)
+    if (retain) {
+      if (msg.info.id === retain) break
+      continue
+    }
+    if (msg.info.role === "user" && completed.has(msg.info.id)) {
+      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+      if (!part) continue
+      if (!part.tail_start_id) break
+      retain = part.tail_start_id
+      if (msg.info.id === retain) break
+      continue
+    }
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error) {
+      completed.add(msg.info.parentID)
+    }
+  }
+  result.reverse()
+  return result
+}
+```
+
+读起来绕，但它解决的是这个问题：
+
+```text
+旧历史 A
+旧历史 B
+user(compaction request)
+assistant(summary=true)
+近期 tail turn 1
+近期 tail turn 2
+最新 user
+```
+
+进入下一轮模型时，不应该再把 A/B 全量塞进去，而应该看到：
+
+```text
+assistant summary
+近期 tail turn 1
+近期 tail turn 2
+最新 user
+```
+
+这就是“压缩替代历史”，不是“在原历史后面追加一个摘要”。如果摘要和原历史同时存在，就会又贵又容易冲突。
+
+### Provider 能力也会影响上下文形态
+
+`toModelMessagesEffect` 里还有 provider 能力判断：
+
+```ts
+const supportsMediaInToolResults = (() => {
+  if (model.api.npm === "@ai-sdk/anthropic") return true
+  if (model.api.npm === "@ai-sdk/openai") return true
+  if (model.api.npm === "@ai-sdk/amazon-bedrock") return true
+  if (model.api.npm === "@ai-sdk/google") {
+    const id = model.api.id.toLowerCase()
+    return id.includes("gemini-3") && !id.includes("gemini-2")
+  }
+  return false
+})()
+```
+
+如果 provider 不支持 tool result 里的媒体附件，opencode 会把媒体提取成额外 user message。这说明上下文排序还受 provider 协议影响。不是“同一份 messages 发给所有模型”，而是“同一份 MessageV2 事实，根据模型能力转换成不同 provider prompt”。
+
+### 多轮中插入 system-reminder 的原因
+
+当 `step > 1 && lastFinished` 时，opencode 会把新 user text 包成：
+
+```text
+<system-reminder>
+The user sent the following message:
+...
+Please address this message and continue with your tasks.
+</system-reminder>
+```
+
+这解决的是一个实际问题：在长工具循环里，用户可能中途又发消息。如果这条消息只是普通 text，模型可能把它当成历史聊天，继续执行旧计划。包成 reminder 后，模型更容易意识到这是“继续任务时必须处理的新用户输入”。
+
+### 从 0 设计建议
+
+不要写成：
+
+```ts
+const context = [
+  systemPrompt,
+  ...messages.map((m) => `${m.role}: ${m.content}`),
+  toolOutputs.join("\n"),
+].join("\n\n")
+```
+
+至少要拆成四层：
+
+```ts
+type RuntimeContext = {
+  system: string[]
+  messages: ModelMessage[]
+  tools: ToolSet
+  permissions: PermissionRules
+}
+
+async function buildRuntimeContext(sessionID: string, model: Model, agent: Agent): Promise<RuntimeContext> {
+  const visible = await session.filterCompacted(sessionID)
+  const transformed = await plugins.transformMessages(visible)
+
+  return {
+    system: [
+      buildEnvironment(model),
+      await buildSkillIndex(agent),
+      ...(await loadInstructions()),
+    ].filter(Boolean),
+    messages: await toModelMessages(transformed, model, {
+      stripMedia: false,
+      toolOutputMaxChars: undefined,
+    }),
+    tools: await resolveTools(agent),
+    permissions: await resolvePermissions(sessionID, agent),
+  }
+}
+```
+
+compaction 也不要只写：
+
+```ts
+const summary = await model.summarize(allMessages)
+messages = [summary, latestUser]
+```
+
+更合理的是：
+
+```ts
+async function compact(messages: MessageWithParts[], model: Model) {
+  const previousSummary = findLatestCompletedSummary(messages)
+  const { head, tailStartID } = await selectHeadAndTail(messages, {
+    tailTurns: 2,
+    preserveRecentTokens: Math.floor(model.usableInputTokens * 0.25),
+  })
+
+  const summary = await summarize({
+    previousSummary,
+    messages: stripMediaAndTruncateToolOutput(head),
+    template: COMPILABLE_TASK_STATE_TEMPLATE,
+  })
+
+  await saveCompactionSummary(summary)
+  await markTailStart(tailStartID)
+  await pruneOldToolOutputs(messages)
+}
+```
+
+### 判断是否设计到位的检查清单
+
+设计自己的 AI 代码助手时，可以用这份清单验收上下文系统：
+
+- 是否把 `system`、`messages`、`tools`、`permissions` 分开，而不是拼成一个 prompt。
+- 是否有结构化 message part，而不是只有 role/content 字符串。
+- tool result 是否保留 toolCallId、输入、输出、错误和 provider metadata。
+- ignored/synthetic text 是否有明确规则，避免不该进模型的文本污染上下文。
+- 文件和媒体是否按 provider 能力转换，而不是一刀切。
+- 最近用户输入是否在长 loop 中被显式提醒模型处理。
+- compaction 是否保留最近 tail turns，而不是把所有历史都摘要掉。
+- summary 是否有固定结构，能恢复目标、约束、进度、阻塞、文件和下一步。
+- 已完成 compaction 是否真的替代旧历史，而不是摘要和原文同时存在。
+- 旧工具输出是否能清理正文但保留结构痕迹。
+- context overflow 是否根据 model usable tokens 判断，而不是写死一个全局长度。
+- 日志是否能分别打印 system、modelMessages、tool output truncation、compaction selection 和 summary 结果。
+
+做到这些，才算真正讲清楚“上下文不是拼字符串，而是多来源事实的压缩和排序”。否则模型看起来能聊天，但一旦进入长任务、工具循环、附件、MCP、子任务和压缩，就会失控。
 
 ### 设计示例
 
+一个最小但正确的上下文构建器应该像这样：
+
 ```ts
-const system = [
-  buildEnvironmentBlock(project),
-  maybeBuildSkillsBlock(agent),
-  ...projectInstructions,
-]
-const messages = [
-  ...system.map((content) => ({ role: "system", content })),
-  ...toModelMessages(sessionMessages),
-]
+const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+  sys.skills(agent),
+  Effect.sync(() => sys.environment(model)),
+  instruction.system().pipe(Effect.orDie),
+  MessageV2.toModelMessagesEffect(msgs, model),
+])
+const system = [...env, ...(skills ? [skills] : []), ...instructions]
 ```
+
+关键不是这几行代码本身，而是它们背后的边界：环境、技能、指令、历史消息分别生成，最后组合。只要这个边界保住，后续你要加 MCP resource、代码索引、RAG、视觉输入、团队记忆，都能在合适层插入，而不是继续往一个巨型 prompt 字符串里塞。
 
 ## 4. 难点四：Provider 差异会污染 Agent 逻辑，必须隔离
 
