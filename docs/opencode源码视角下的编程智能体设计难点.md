@@ -397,15 +397,29 @@ async function prompt(input: PromptInput) {
 
 ### 为什么难
 
-模型可能：
+Agent Loop 是编程智能体的“心跳”。它不是简单的：
+
+```ts
+while (true) {
+  const answer = await model(messages)
+  if (answer.done) break
+}
+```
+
+真正的 loop 每一轮都要重新读取会话状态、判断历史消息是否已经完成、处理挂起的 subtask/compaction、生成 assistant message、调用 LLM、执行工具、把工具结果写回消息流，然后决定下一轮是否还要继续。
+
+难点在于：模型的输出不是唯一真相，runtime 的结构化状态才是最终依据。模型可能：
 
 - 直接回答完成
 - 请求工具
-- provider 返回 `stop`，但 message 里其实有 tool calls
+- provider 返回 `stop`，但 assistant message 里其实有 tool calls
 - 触发上下文压缩
 - 触发 subtask
 - 到达 agent 最大步数
 - 中途被权限拒绝或用户取消
+- 返回结构化输出
+- 因上下文溢出要求 compact 后重试
+- 在上一轮已经完成，但当前进程重入了 loop
 
 如果停止条件写得粗糙，结果就是：
 
@@ -413,12 +427,59 @@ async function prompt(input: PromptInput) {
 - 模型反复调用同一个工具
 - 已完成还继续消耗 token
 - 中途失败但状态看起来像成功
+- 用户新消息被历史 assistant finish 遮住
+- 上下文溢出后直接失败，而不是压缩后继续
+- 达到最大步数后继续放任工具调用，进入长循环
 
 ### opencode 源码落点
 
 `session/prompt.ts` 的 `runLoop(sessionID)` 是核心。
 
-关键停止判断：
+它的骨架可以简化成：
+
+```ts
+let step = 0
+while (true) {
+  const msgs = await MessageV2.filterCompactedEffect(sessionID)
+  const { lastUser, lastAssistant, lastFinished, tasks } = scan(msgs)
+
+  if (alreadyFinished(lastUser, lastAssistant)) break
+
+  step++
+  const model = await getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+
+  const task = tasks.pop()
+  if (task?.type === "subtask") {
+    await handleSubtask(...)
+    continue
+  }
+  if (task?.type === "compaction") {
+    const result = await compaction.process(...)
+    if (result === "stop") break
+    continue
+  }
+  if (isOverflow(lastFinished, model)) {
+    await compaction.create(...)
+    continue
+  }
+
+  const agent = await agents.get(lastUser.agent)
+  const isLastStep = step >= (agent.steps ?? Infinity)
+  const assistant = await createAssistantMessage(lastUser, agent, model)
+  const result = await processor.process({ messages, tools, isLastStep })
+
+  if (structuredOutputDone()) break
+  if (result === "stop") break
+  if (result === "compact") await compaction.create(...)
+  continue
+}
+```
+
+这段伪代码的重点不是语法，而是控制权归属：loop 每一轮都从 session message stream 恢复状态，而不是相信内存里的某个局部变量。
+
+### 第一层判断：这轮是不是已经完成
+
+opencode 在进入新 LLM 调用前，会先判断当前 session 是否已经有完成的 assistant：
 
 ```ts
 const hasToolCalls =
@@ -434,38 +495,327 @@ if (
 }
 ```
 
-### 讲透
+这段代码回答的是“是否需要再次调用模型”。四个条件缺一不可：
 
-这段逻辑的微妙点是：不能只相信 provider 的 finish reason。
+| 条件 | 含义 | 如果漏掉会怎样 |
+| --- | --- | --- |
+| `lastAssistant?.finish` | assistant 已经有结束标记 | 没结束就停，会截断工具或文本流 |
+| `finish !== "tool-calls"` | 不是 provider 明确要求继续工具调用 | 工具调用没回喂就停止 |
+| `!hasToolCalls` | message parts 里也没有未处理 tool part | provider 误报 `stop` 时会漏执行工具 |
+| `lastUser.id < lastAssistant.id` | assistant 确实在最后一个 user 之后 | 用户发了新消息却被旧 assistant finish 拦住 |
 
-有些 provider 会返回 `stop`，但 assistant message parts 里仍然包含工具调用。如果这时直接停止，工具永远不会执行。opencode 用 `hasToolCalls` 修正 provider 行为差异。
+这里最值得学的是：停止条件不能只看一个字段。普通聊天可以相信 `finish_reason=stop`，编程智能体不行。因为工具调用、provider-executed tool、历史消息顺序、用户新消息，都可能改变“是否完成”的真实含义。
 
-这也是编程智能体比普通聊天难的地方：你不能只看模型文本，还要看结构化 part 状态。
+### 第二层判断：有没有挂起的 runtime 任务
 
-### 流程图
+进入 LLM 之前，opencode 会先处理 `subtask` 和 `compaction`：
+
+```ts
+const task = tasks.pop()
+
+if (task?.type === "subtask") {
+  yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+  continue
+}
+
+if (task?.type === "compaction") {
+  const result = yield* compaction.process({
+    messages: msgs,
+    parentID: lastUser.id,
+    sessionID,
+    auto: task.auto,
+    overflow: task.overflow,
+  })
+  if (result === "stop") break
+  continue
+}
+```
+
+这说明 loop 不是“模型专用循环”，而是“会话任务调度器”。有些轮次根本不会调用模型，而是先把 runtime 内部任务处理掉。
+
+| pending task | 为什么要优先处理 | 处理后为什么 `continue` |
+| --- | --- | --- |
+| `subtask` | 子任务结果需要先汇总回父会话 | 消息流变了，要重新扫描 lastUser/lastAssistant |
+| `compaction` | 上下文压缩会改变可见历史 | 压缩后要用新 messages 重新判断 |
+| overflow auto compaction | 不压缩会继续超上下文 | 创建 compaction part 后下一轮处理 |
+
+如果这里不 `continue`，而是在同一轮继续向下调用 LLM，就会拿旧消息做推理，轻则重复，重则上下文错乱。
+
+### 第三层判断：上下文是否已经溢出
+
+opencode 在发现上一条完成消息 token 超限时，会创建自动 compaction：
+
+```ts
+if (
+  lastFinished &&
+  lastFinished.summary !== true &&
+  (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+) {
+  yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+  continue
+}
+```
+
+这里的难点是：溢出不是普通错误，而是一种“需要改写历史再继续”的状态。如果直接失败，用户体验差；如果不压缩继续调模型，provider 可能报 context overflow；如果压缩后不重新进入 loop，模型仍然拿不到压缩后的上下文。
+
+所以正确动作是三步：
+
+1. 检测 `lastFinished.tokens` 是否对当前 model 溢出。
+2. 写入 compaction task。
+3. `continue`，让下一轮基于压缩后的 message stream 重跑。
+
+### 第四层判断：最大步数不是杀进程，而是改变最后一轮输入
+
+opencode 读取 agent 的步数限制：
+
+```ts
+const maxSteps = agent.steps ?? Infinity
+const isLastStep = step >= maxSteps
+```
+
+然后在调用模型时，如果已经是最后一步，会追加 `MAX_STEPS` 提醒：
+
+```ts
+messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])]
+```
+
+`MAX_STEPS` 的含义是：最大步数已到，接下来必须只用文本总结，不能再调用工具。需要注意，当前源码里的实现方式是把 `MAX_STEPS` 作为一条强约束消息追加到模型输入里，而不是在这一行直接把 `tools` map 清空。所以它更像“最后一步收束协议”，不是底层硬断路器。
+
+这个设计不是简单 `if (step > max) throw Error`，原因是编程智能体即使到达上限，也应该给用户一个可读交代：
+
+- 已经做了什么
+- 还剩什么没做
+- 下一步建议是什么
+- 为什么不能继续工具调用
+
+这比硬中断更适合 CLI/TUI 场景。硬中断只会留下半截工具状态；最后一轮文本总结能把状态收束给用户。
+
+### 第五层判断：LLM 处理器返回后怎么决定下一步
+
+真正调用模型后，opencode 根据 `handle.process(...)` 的结果和 assistant message 状态做判断：
+
+```ts
+if (structured !== undefined) {
+  handle.message.structured = structured
+  handle.message.finish = handle.message.finish ?? "stop"
+  yield* sessions.updateMessage(handle.message)
+  return "break" as const
+}
+
+const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+if (finished && !handle.message.error) {
+  if (format.type === "json_schema") {
+    handle.message.error = new MessageV2.StructuredOutputError({
+      message: "Model did not produce structured output",
+      retries: 0,
+    }).toObject()
+    yield* sessions.updateMessage(handle.message)
+    return "break" as const
+  }
+}
+
+if (result === "stop") return "break" as const
+if (result === "compact") {
+  yield* compaction.create({
+    sessionID,
+    agent: lastUser.agent,
+    model: lastUser.model,
+    auto: true,
+    overflow: !handle.message.finish,
+  })
+}
+return "continue" as const
+```
+
+这段逻辑把“模型完成了没有”拆成多个信号：
+
+| 信号 | 动作 | 原因 |
+| --- | --- | --- |
+| `structured !== undefined` | 写入 structured，`break` | 结构化输出已经通过工具捕获，任务完成 |
+| `format=json_schema` 但没 structured | 写错误，`break` | 用户要求结构化输出，普通文本不合格 |
+| `result === "stop"` | `break` | processor 明确认为本轮完成 |
+| `result === "compact"` | 创建 compaction，`continue` | 需要压缩后继续 |
+| 其他情况 | `continue` | 可能有工具结果、未知 finish、下一轮任务 |
+
+这也是 loop 难写的地方：`finish`、`result`、`structured`、`error` 都只是局部信号，必须组合判断。
+
+### 完整状态机
 
 ```mermaid
 flowchart TD
-  A["读取 MessageV2.filterCompactedEffect"] --> B["找到 lastUser / lastAssistant / lastFinished"]
-  B --> C{"assistant 是否 finish?"}
-  C -- 否 --> F["继续 loop"]
-  C -- 是 --> D{"是否仍有未处理 tool calls?"}
-  D -- 是 --> F
-  D -- 否 --> E{"lastUser.id < lastAssistant.id?"}
-  E -- 是 --> G["break: 本轮完成"]
-  E -- 否 --> F
+  A["loop start: 读取 compacted messages"] --> B["扫描 lastUser / lastAssistant / lastFinished / tasks"]
+  B --> C{"已有完成 assistant 且无未处理 tool calls?"}
+  C -- 是 --> Z["break: 会话完成"]
+  C -- 否 --> D["step++ / 解析 model"]
+  D --> E{"有 pending subtask?"}
+  E -- 是 --> E1["handleSubtask"] --> A
+  E -- 否 --> F{"有 pending compaction?"}
+  F -- 是 --> F1["compaction.process"] --> F2{"result == stop?"}
+  F2 -- 是 --> Z
+  F2 -- 否 --> A
+  F -- 否 --> G{"lastFinished tokens overflow?"}
+  G -- 是 --> G1["compaction.create(auto)"] --> A
+  G -- 否 --> H["解析 agent / tools / reminders"]
+  H --> I{"step >= maxSteps?"}
+  I -- 是 --> I1["追加 MAX_STEPS 文本约束"]
+  I -- 否 --> J["生成 system + model messages"]
+  I1 --> J
+  J --> K["processor.process 调用 LLM + tools"]
+  K --> L{"structured output captured?"}
+  L -- 是 --> Z
+  L -- 否 --> M{"processor result == stop?"}
+  M -- 是 --> Z
+  M -- 否 --> N{"processor result == compact?"}
+  N -- 是 --> N1["compaction.create"] --> A
+  N -- 否 --> A
 ```
+
+从这张图可以看出，`break` 只有少数明确出口；大多数路径都是 `continue`，因为编程智能体的中间状态必须回到消息流再判断一次。
+
+### 用一个真实任务走一遍
+
+继续用“修 opencode_debug 日志，打包安装”的例子：
+
+1. 第 1 轮 loop 读取 user message，发现还没有 assistant finish，于是继续。
+2. 没有 pending subtask/compaction，也没 overflow，创建 assistant message。
+3. 解析 agent、model、tools，把日志问题、项目上下文、工具 schema 发给模型。
+4. 模型调用 read/grep/bash 等工具，processor 把 tool call 和 tool result 写成 parts。
+5. 因为出现 tool calls，loop 不能停，必须 `continue`，让工具结果回到下一轮模型输入。
+6. 第 2 轮 loop 重新读取 message stream，此时上下文里已经有工具结果。
+7. 模型根据工具结果决定修改文件，调用 edit/bash。
+8. 修改完成后，模型返回最终文本，`finish=stop` 且无未处理 tool calls。
+9. `lastUser.id < lastAssistant.id` 成立，loop `break`，返回最后 assistant。
+
+如果第 5 步错误停止，模型永远看不到工具结果；如果第 8 步错误继续，就会无意义地多跑一轮甚至重复工具调用。
+
+### 为什么 `lastUser.id < lastAssistant.id` 很关键
+
+这个条件看起来像细节，其实是防止“旧完成状态覆盖新用户输入”。
+
+假设历史是：
+
+```text
+user-100: 帮我修日志
+assistant-200: 已修复，finish=stop
+user-300: 再帮我把日志时间改成北京时间
+```
+
+如果 loop 只看 `lastAssistant.finish=stop` 就停止，那么 `user-300` 永远不会被处理。`lastUser.id < lastAssistant.id` 要求最后一个 assistant 必须比最后一个 user 更新，才能说明它回答的是当前最新用户消息。
+
+这是编程智能体里很常见的 bug：历史里确实有一个完成回复，但它不是对最新输入的回复。
+
+### 为什么不能只看 provider finish reason
+
+不同 provider 对 tool call 的 finish 行为并不一致。有的会返回 `tool-calls`，有的可能返回 `stop`，但消息里已经包含工具调用。opencode 所以额外检查：
+
+```ts
+part.type === "tool" && !part.metadata?.providerExecuted
+```
+
+这里还排除了 `providerExecuted`，因为有些平台会在 provider 内部完成工具调用，不需要 opencode 再 re-loop 执行一次。
+
+判断逻辑可以理解为：
+
+| provider finish | message parts | opencode 应该做什么 |
+| --- | --- | --- |
+| `stop` | 没有 tool part | 可以停 |
+| `stop` | 有未处理 tool part | 不能停，要继续 |
+| `tool-calls` | 有 tool part | 继续 |
+| `stop` | 只有 providerExecuted tool part | 可以停或按 provider 结果处理 |
+| `unknown` | 不确定 | 倾向继续或交给 processor 结果判断 |
+
+这就是“结构化消息状态优先于 provider 单字段”的设计原则。
 
 ### 从 0 设计建议
 
-loop 停止条件必须至少考虑：
+不要写成：
 
 ```ts
-if (assistant.finish && !assistant.hasPendingToolCalls && assistant.parentUserId === lastUser.id) stop()
-if (step >= agent.maxSteps) stopWithMaxStepNotice()
-if (contextOverflow) compactAndContinue()
-if (permissionDenied) stopOrContinueByPolicy()
+while (true) {
+  const res = await model.chat(messages)
+  if (res.finishReason === "stop") break
+  if (res.toolCalls.length) await runTools(res.toolCalls)
+}
 ```
+
+至少要把 loop 写成状态机：
+
+```ts
+async function runLoop(sessionID: string) {
+  let step = 0
+
+  while (true) {
+    const messages = await session.readVisibleMessages(sessionID)
+    const state = scanLoopState(messages)
+
+    if (state.doneForLatestUser) return state.lastAssistant
+
+    step++
+    const model = await resolveModel(state.lastUser.model)
+
+    if (state.pendingSubtask) {
+      await runSubtask(state.pendingSubtask)
+      continue
+    }
+
+    if (state.pendingCompaction || isOverflow(state.lastFinished, model)) {
+      const result = await compact(sessionID, state)
+      if (result === "stop") return await session.lastAssistant(sessionID)
+      continue
+    }
+
+    const agent = await resolveAgent(state.lastUser.agent)
+    const assistant = await session.createAssistantMessage({
+      sessionID,
+      parentID: state.lastUser.id,
+      agent: agent.name,
+      model,
+    })
+
+    const result = await processor.process({
+      assistant,
+      messages: addMaxStepReminder(messages, step, agent.steps),
+      tools: await resolveTools(agent, state.lastUser.tools),
+    })
+
+    if (result.kind === "stop") return assistant
+    if (result.kind === "compact") await enqueueCompaction(sessionID)
+  }
+}
+```
+
+`scanLoopState` 至少要产出这些字段：
+
+```ts
+type LoopState = {
+  lastUser: UserMessage
+  lastAssistant?: AssistantMessage
+  lastFinished?: AssistantMessage
+  pendingSubtask?: SubtaskPart
+  pendingCompaction?: CompactionPart
+  hasUnhandledToolCalls: boolean
+  doneForLatestUser: boolean
+}
+```
+
+### 判断是否设计到位的检查清单
+
+设计自己的 AI 代码助手时，可以用这份清单验收 Agent Loop：
+
+- loop 是否每轮都从持久化 session message stream 重新读取状态。
+- 停止条件是否同时考虑 `finish`、未处理 tool calls、用户/assistant 顺序。
+- provider 返回 `stop` 但消息里有 tool calls 时，是否仍会继续。
+- provider 内部已执行的 tool call 是否避免重复执行。
+- subtask、compaction 这类 runtime task 是否优先于新 LLM 调用。
+- context overflow 是否能创建 compaction 并重新进入 loop。
+- 达到最大步数时是否给用户总结，而不是直接崩溃或沉默退出。
+- 结构化输出是否有专门完成路径和错误路径。
+- tool result 写回后是否一定重新进入 loop，让模型看到结果。
+- 权限拒绝、用户取消、processor error 是否能落到 assistant message，而不是丢成进程异常。
+- loop 是否有清晰的 `break` 出口和 `continue` 出口，避免隐藏死循环。
+- 日志是否打印 `sessionID`、`step`、`assistantMessageID`、`result`、`finish`、`toolCount`、`maxSteps`。
+
+做到这些，才算真正讲清楚“Agent Loop 必须知道什么时候继续、什么时候停”。否则只是一个聊天 while 循环，不能支撑真实的编程智能体。
 
 ## 3. 难点三：上下文不是拼字符串，而是多来源事实的压缩和排序
 
