@@ -81,9 +81,111 @@ sequenceDiagram
 - 本轮是否覆盖工具权限
 - prompt parts 是否包含文件、agent 指令、结构化输出要求
 
+### 一个具体例子
+
+假设用户输入：
+
+```text
+opencode_debug 启动后日志只显示启动，后续 prompt/LLM/tool 流程看不到。帮我修一下，并打包安装。
+```
+
+人能理解这句话，但 runtime 不能直接执行这句话。runtime 必须把它拆成一组状态：
+
+```ts
+const input = {
+  sessionID: "ses_123",
+  messageID: "msg_456",
+  agent: "build",
+  model: {
+    providerID: "getrouter",
+    modelID: "gpt-5.4",
+  },
+  variant: undefined,
+  parts: [
+    {
+      type: "text",
+      text: "opencode_debug 启动后日志只显示启动，后续 prompt/LLM/tool 流程看不到。帮我修一下，并打包安装。",
+    },
+  ],
+  tools: {
+    bash: true,
+    edit: true,
+    read: true,
+    grep: true,
+  },
+  noReply: false,
+  format: { type: "text" },
+}
+```
+
+这个对象不是为了“类型好看”，而是为了让后续每一步都有挂靠点：
+
+| 字段 | 如果缺失会怎样 |
+| --- | --- |
+| `sessionID` | 后续消息、工具结果、权限审批、日志无法归属到同一会话 |
+| `messageID` | assistant 回复、tool part、patch part 没有父子关系 |
+| `agent` | 不知道使用 build、plan、explore 还是 subagent，也无法确定权限 |
+| `model` | provider/model 无法固定，重放和排错困难 |
+| `variant` | 同一 model 的推理档位、能力变体或 provider 特性无法复现 |
+| `parts` | 无法表达文本、附件、文件、agent 指令、结构化输入 |
+| `tools` | 无法单轮启用/禁用工具，例如临时禁止 edit 或 task |
+| `noReply` | 无法支持“只写入消息、不触发模型”的系统操作 |
+| `format` | 无法表达普通文本和 JSON schema 输出的差异 |
+
+所以“目标理解”的第一步不是让模型推理，而是把自然语言编译成可执行状态。
+
+这里容易误解。“目标理解”不是要求入口层猜出完整实现方案，也不是要求入口层替模型完成所有规划。入口层真正要做的是把用户话语转成一个可被 runtime 执行的最小闭包：谁说的、在哪个会话里说的、用什么 agent/model 处理、允许哪些工具、输入由哪些 part 组成、是否真的触发模型。至于“先读日志模块还是先跑命令”“要不要重编译安装”，这些可以留给后面的 agent loop 和工具调用逐步完成。
+
+如果用老师批改作业的标准看，这一节要回答完整，至少要说清楚四层问题：
+
+| 层次 | 要回答的问题 | opencode 对应机制 |
+| --- | --- | --- |
+| 语义层 | 用户到底要解决什么问题 | 用户文本、附件、agent/system prompt 进入 `parts` |
+| 执行层 | 这句话怎样变成 runtime 可执行输入 | `PromptInput`、`createUserMessage`、`runLoop` |
+| 状态层 | 执行过程如何恢复、追踪、订阅 | `sessionID`、`messageID`、MessageV2 parts、Bus/SSE |
+| 约束层 | 哪些工具能用、用什么模型、何时不回复 | `agent`、`model`、`variant`、`tools`、`noReply`、`format` |
+
+只讲“把 prompt 存起来再调用模型”是不完整的，因为它没有解释约束层和状态层；只讲“让模型做 plan”也不完整，因为它跳过了 runtime 为什么能追踪、恢复、授权和重放。
+
+### 从自然语言到可执行状态
+
+```mermaid
+flowchart TD
+  A["用户自然语言"] --> B["CLI/TUI/API 解析"]
+  B --> C["PromptInput"]
+  C --> D["createUserMessage(input)"]
+  D --> E["MessageV2.User + parts 落库"]
+  C --> F["session permission override"]
+  E --> G{"noReply?"}
+  G -- 是 --> H["返回 user message，不进入模型"]
+  G -- 否 --> I["runLoop(sessionID)"]
+  I --> J["从 session message stream 构造上下文"]
+  J --> K["resolve agent/model/tools"]
+  K --> L["LLM + tool loop"]
+```
+
+这里最关键的一句是：Agent loop 不直接消费原始 prompt，它消费的是 session message stream。也就是说，用户目标一旦进入 opencode，就变成了持久化事实，而不是临时字符串。
+
 ### opencode 源码落点
 
-核心入口在 `packages/opencode/src/session/prompt.ts` 的 `prompt(input)`。
+核心入口在 `packages/opencode/src/session/prompt.ts` 的 `prompt(input)`。它的输入类型由同一个文件里的 `PromptInput` 定义，实际字段包括：
+
+```ts
+export const PromptInput = z.object({
+  sessionID: SessionID.zod,
+  messageID: MessageID.zod.optional(),
+  model: z.object({ providerID: ProviderID.zod, modelID: ModelID.zod }).optional(),
+  agent: z.string().optional(),
+  noReply: z.boolean().optional(),
+  tools: z.record(z.string(), z.boolean()).optional(),
+  format: MessageV2.Format.zod.optional(),
+  system: z.string().optional(),
+  variant: z.string().optional(),
+  parts: z.array(...),
+})
+```
+
+这个类型定义就是“目标理解”的第一道工程边界。CLI、TUI、HTTP API、task tool、subagent 入口最终都要把请求对齐到这类结构，而不是把自然语言字符串随手传给 provider。
 
 关键逻辑：
 
@@ -118,6 +220,90 @@ const prompt = Effect.fn("SessionPrompt.prompt")(function* (input) {
 - 权限可以按 session 覆盖，不是全局开关。
 - `noReply` 支持只写入消息不触发模型，这对自动化、同步、重放很重要。
 
+再结合上面的例子看：
+
+1. `sessions.get(input.sessionID)` 找到当前会话边界，后续所有状态都挂在这个会话上。
+2. `revert.cleanup(session)` 清理可能存在的回滚状态，避免旧状态污染新任务。
+3. `createUserMessage(input)` 把自然语言和附件转成 `MessageV2.User` 及 parts。
+4. `sessions.touch(input.sessionID)` 更新时间，TUI 会话列表和排序依赖它。
+5. `input.tools` 被转成 session permission override，用于控制本轮工具可用性。
+6. `noReply` 决定是否进入模型 loop。
+7. `loop({ sessionID })` 只拿 sessionID，再从持久化消息里恢复上下文。
+
+这就是为什么 opencode 能做到 TUI、非交互 run、subtask、MCP、skill 都走同一套 runtime。入口可以不同，但进入 runtime 后都是结构化 session 状态。
+
+### 这个例子里真正发生了什么
+
+继续用“日志只看到启动，后续 prompt/LLM/tool 流程看不到”这个例子。一个成熟的编程智能体不能只把这句话发给模型，而要在状态里保留这些事实：
+
+| 用户话语里的信息 | 应该进入的 runtime 状态 | 后续用途 |
+| --- | --- | --- |
+| “opencode_debug” | text part + 当前工作区上下文 | 模型知道目标是 debug CLI，不是普通 opencode |
+| “日志只显示启动” | text part | 引导模型查日志初始化和后续调用链 |
+| “后续 prompt/LLM/tool 流程看不到” | text part | 引导模型检查 prompt、llm、processor、tool 执行路径 |
+| “帮我修一下” | agent/task intent | 允许进入编辑和验证流程 |
+| “并打包安装” | text part + tool permission | 后续需要 build/install 命令权限 |
+| 当前会话 | `sessionID` | 所有消息、工具结果、日志归到同一条链路 |
+| 本轮模型 | `model`/`variant` | 排查 provider 行为和复现输出 |
+| 本轮工具权限 | `tools` 或 session permission | 决定能否 read/edit/bash/build |
+
+这张表说明：自然语言里有些内容保持为文本即可，有些内容必须提升为 runtime 字段。如果全部都塞进字符串，系统就无法在模型之外做权限、恢复、订阅、重放和调试。
+
+### 缺信息时应该怎么办
+
+目标理解还包括“不确定时如何处理”。比如用户只说“帮我修一下日志”，但没有说明项目、命令、期望日志目录。入口层不应该假装已经理解一切，而要把确定事实先落库，把不确定性留给 agent loop：
+
+```ts
+const input = {
+  sessionID,
+  parts: [{ type: "text", text: "帮我修一下日志" }],
+  agent: "build",
+  tools: { read: true, grep: true, bash: true, edit: true },
+}
+await sessionPrompt.prompt(input)
+```
+
+然后 agent loop 通过工具逐步消除不确定性：
+
+1. 先读项目结构和已有日志模块。
+2. 再运行最小复现命令。
+3. 如果命令需要危险权限，再走权限系统。
+4. 如果仍缺关键信息，再向用户提问。
+
+这比“入口层一次性猜完所有计划”更可靠。入口层负责形成可执行状态，loop 层负责在工具反馈中逐步收敛目标。
+
+### 如果只做 model.chat(prompt)，会坏在哪里
+
+```ts
+const answer = await model.chat("帮我修一下日志问题")
+```
+
+这种写法看起来能跑 demo，但一进入编程智能体就会坏：
+
+| 缺口 | 后果 |
+| --- | --- |
+| 没有 session | 无法恢复、无法订阅事件、无法把多轮工具结果串起来 |
+| 没有 message id | tool result、patch、reasoning、text delta 无法挂靠 |
+| 没有 agent | 不知道该用 build 还是 plan，也无法绑定权限和 step budget |
+| 没有 model ref | 不能稳定复现，也无法解释为什么用了某个 provider |
+| 没有 parts | 文件、图片、MCP resource、agent 指令只能混成字符串 |
+| 没有 permission override | 不能单轮禁用危险工具或临时允许某个能力 |
+| 没有 noReply | 无法做“只记录事件/同步状态/预写消息”的内部操作 |
+| 没有持久化 | 进程中断后无法继续，也无法做 flow log 对照 |
+
+### 它和后续难点的关系
+
+难点一是所有后续模块的入口。如果这里没有把 prompt 变成可执行状态，后面这些能力都很难可靠实现：
+
+- **工具调用**：tool call 需要 `sessionID/messageID/callID` 才能落成 part。
+- **权限系统**：权限请求需要知道 session、tool、patterns、ruleset。
+- **MCP**：外部工具结果要回写到同一条 assistant message。
+- **Skill**：skill 加载要进入上下文，并受 agent permission 控制。
+- **子任务**：task tool 需要 parent session 和子 session。
+- **compaction**：压缩的是 session message stream，不是单个 prompt。
+- **replay/debug**：日志要能从 prompt 追到 provider body 和工具结果。
+- **TUI 更新**：UI 订阅的是 session/event，不是一个同步函数返回值。
+
 ### 如果你从 0 设计
 
 不要写成：
@@ -133,6 +319,79 @@ const userMessage = await session.createUserMessage(prompt)
 await session.applyPromptOverrides(prompt.options)
 if (!prompt.noReply) await agentLoop.run(session.id)
 ```
+
+更完整一点，可以把入口拆成三步：
+
+```ts
+const input = await parsePromptRequest(cliOrTuiPayload)
+const message = await session.createUserMessage(input)
+await session.applyRuntimeOverrides(input.sessionID, {
+  tools: input.tools,
+  format: input.format,
+  agent: input.agent,
+  model: input.model,
+})
+if (!input.noReply) await agentLoop.run(input.sessionID)
+```
+
+这才是“目标理解”的工程含义：不是让模型理解一句话，而是让 runtime 获得一份可执行、可追踪、可恢复、可授权的状态。
+
+更工程化的最小实现可以长这样：
+
+```ts
+type PromptInput = {
+  sessionID: string
+  messageID?: string
+  agent?: string
+  model?: { providerID: string; modelID: string }
+  variant?: string
+  parts: Array<{ type: "text"; text: string } | { type: "file"; path: string }>
+  tools?: Record<string, boolean>
+  noReply?: boolean
+  format?: { type: "text" } | { type: "json_schema"; schema: unknown }
+}
+
+async function prompt(input: PromptInput) {
+  const session = await sessions.get(input.sessionID)
+  await revert.cleanup(session)
+
+  const userMessage = await messages.createUser({
+    id: input.messageID ?? ids.message(),
+    sessionID: input.sessionID,
+    agent: input.agent ?? (await agents.default()),
+    model: input.model ?? (await sessions.lastModel(input.sessionID)),
+    variant: input.variant,
+    parts: input.parts,
+    format: input.format,
+    tools: input.tools,
+  })
+
+  if (input.tools) {
+    await sessions.setPermission(input.sessionID, toPermissionRules(input.tools))
+  }
+
+  await sessions.touch(input.sessionID)
+  if (input.noReply) return userMessage
+  return agentLoop.run({ sessionID: input.sessionID })
+}
+```
+
+这个版本没有 opencode 的 Effect、Bus、processor、snapshot、MCP 复杂度，但保留了最重要的架构骨架：先把目标编译成状态，再让 loop 基于状态运行。
+
+### 判断是否设计到位的检查清单
+
+设计自己的 AI 代码助手时，可以用这份清单验收“目标理解”有没有做到位：
+
+- 用户输入是否有稳定的 `sessionID` 和 `messageID`。
+- 文本、文件、图片、子任务、agent 指令是否能用 `parts` 区分，而不是全部拼成字符串。
+- agent、model、variant 是否被记录到 user message，方便复现和排错。
+- 工具权限是否能按会话或按本轮覆盖，而不是全局开关。
+- `noReply` 这类内部操作是否能只写状态、不触发模型。
+- 结构化输出要求是否进入 `format`，而不是只靠 prompt 里一句“请返回 JSON”。
+- agent loop 是否只依赖 session message stream，而不是依赖入口函数里的临时变量。
+- 日志是否能从 `sessionID/messageID` 追到 provider 请求、tool call、tool result 和最终 assistant message。
+
+做到这些，才算真正回答了“目标理解不是一句 prompt，而是要变成可执行状态”。否则只是把聊天 demo 包了一层 CLI，还没有进入编程智能体的工程形态。
 
 ## 2. 难点二：Agent Loop 必须知道什么时候继续、什么时候停
 
