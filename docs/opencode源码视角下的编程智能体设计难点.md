@@ -1387,6 +1387,24 @@ const system = [...env, ...(skills ? [skills] : []), ...instructions]
 
 ### 为什么难
 
+表面上，所有大模型调用都像这样：
+
+```ts
+await model.generate({
+  system,
+  messages,
+  tools,
+  temperature,
+})
+```
+
+但真实工程里，不同 provider 的差异会从四个方向污染 Agent：
+
+1. 请求参数不同。
+2. 消息格式不同。
+3. 工具协议不同。
+4. 流式事件和错误行为不同。
+
 不同模型 API 在这些地方都可能不同：
 
 - system prompt 放哪里
@@ -1397,12 +1415,64 @@ const system = [...env, ...(skills ? [skills] : []), ...instructions]
 - 是否支持 temperature
 - 是否支持 OpenAI Responses API
 - 是否是 LiteLLM/GitLab workflow 代理
+- 是否支持图片、PDF、音频、视频输入
+- providerOptions 应该放在 `openai`、`anthropic`、`bedrock`、`gateway` 还是自定义 namespace
+- prompt cache 的字段名是 `promptCacheKey`、`prompt_cache_key`、`cacheControl` 还是 `cachePoint`
+- tool call id 是否允许特殊字符
+- assistant tool_use 后是否允许再跟文本
+- 空字符串 message 是否会被拒绝
 
 如果业务 loop 直接处理这些差异，会很快变成一坨 if/else。
 
+更严重的是，一旦 provider 差异泄漏到 Agent Loop，Agent 就不再是“会话状态机”，而变成“供应商协议状态机”。后果是：
+
+- 新增一个 provider 要改 Agent Loop。
+- 修一个 provider bug 可能影响所有模型。
+- 工具权限、compaction、structured output 这些 runtime 语义会被 provider 细节绑死。
+- 日志里看不清是 Agent 决策错了，还是 provider adapter 转换错了。
+
+所以难点四的核心不是“怎么支持很多模型”，而是“怎么让 Agent 永远只面对统一语义，把供应商差异关在 adapter 层”。
+
 ### opencode 源码落点
 
-在 `session/llm.ts`：
+核心边界在两处：
+
+- `session/llm.ts`：把 Agent runtime 输入转换成 AI SDK `streamText` 调用。
+- `provider/transform.ts`：处理 provider/model 级消息和参数差异。
+
+Agent Loop 传给 LLM 的 `StreamInput` 是统一语义：
+
+```ts
+export type StreamInput = {
+  user: MessageV2.User
+  sessionID: string
+  parentSessionID?: string
+  model: Provider.Model
+  agent: Agent.Info
+  permission?: Permission.Ruleset
+  system: string[]
+  messages: ModelMessage[]
+  small?: boolean
+  tools: Record<string, Tool>
+  retries?: number
+  toolChoice?: "auto" | "required" | "none"
+}
+```
+
+这里没有 OpenAI/Anthropic/Gemini 分支。Agent Loop 只表达：
+
+- 本轮用户是谁
+- 用哪个 model
+- system/messages 是什么
+- tools 是什么
+- toolChoice 是什么
+- permission 是什么
+
+至于这些语义如何变成供应商请求，是 `session/llm.ts` 和 `ProviderTransform` 的责任。
+
+### 参数差异：先合并成统一 options，再映射到 providerOptions
+
+在 `session/llm.ts`，opencode 先构造基础参数，再按层级合并：
 
 ```ts
 const base = input.small
@@ -1421,7 +1491,144 @@ const options = pipe(
 )
 ```
 
-provider 消息转换：
+这是一条非常重要的优先级链：
+
+```text
+provider/model 默认参数
+  < model.options
+  < agent.options
+  < variant options
+```
+
+它解决的是“同一个模型在不同 agent 或 variant 下应该有不同参数”的问题。例如：
+
+- 普通 agent 用默认 reasoning effort。
+- summary/标题生成这种 small call 降低 reasoning。
+- 某个 agent 想覆盖 temperature/topP。
+- 用户选了 model variant，需要覆盖 provider 参数。
+
+如果这些逻辑散落在 Agent Loop 里，loop 会充满 `if model is gpt-5 then reasoningEffort=...`。opencode 把它们放到 `ProviderTransform.options(...)` 和合并链里。
+
+然后真正传给 AI SDK 前，再映射成 providerOptions：
+
+```ts
+const providerOptions = ProviderTransform.providerOptions(input.model, params.options)
+```
+
+`provider/transform.ts` 里处理 namespace：
+
+```ts
+export function providerOptions(model: Provider.Model, options: { [x: string]: any }) {
+  if (model.api.npm === "@ai-sdk/gateway") {
+    const i = model.api.id.indexOf("/")
+    const rawSlug = i > 0 ? model.api.id.slice(0, i) : undefined
+    const slug = rawSlug ? (SLUG_OVERRIDES[rawSlug] ?? rawSlug) : undefined
+    const gateway = options.gateway
+    const rest = Object.fromEntries(Object.entries(options).filter(([k]) => k !== "gateway"))
+    ...
+    return result
+  }
+
+  const key = sdkKey(model.api.npm) ?? model.providerID
+  if (model.api.npm === "@ai-sdk/azure") {
+    return { openai: options, azure: options }
+  }
+  return { [key]: options }
+}
+```
+
+这说明 provider 参数不是简单 `{ ...options }`。同一个 `reasoningEffort`、`cacheControl`、`thinkingConfig`，在不同 SDK 下可能要放到不同 namespace。
+
+### 默认参数差异：集中在 ProviderTransform.options
+
+`ProviderTransform.options(...)` 里有大量 provider/model 特例：
+
+```ts
+if (input.model.providerID === "openai" || input.model.api.npm === "@ai-sdk/openai") {
+  result["store"] = false
+}
+
+if (input.model.api.npm === "@ai-sdk/azure") {
+  result["store"] = true
+  result["promptCacheKey"] = input.sessionID
+}
+
+if (input.model.api.npm === "@openrouter/ai-sdk-provider") {
+  result["usage"] = { include: true }
+}
+
+if (input.model.api.id.includes("gpt-5") && !input.model.api.id.includes("gpt-5-chat")) {
+  result["reasoningEffort"] = "medium"
+  if (input.model.api.npm === "@ai-sdk/openai" || input.model.api.npm === "@ai-sdk/azure") {
+    result["reasoningSummary"] = "auto"
+  }
+}
+```
+
+这些不是业务逻辑，而是 provider 协议适配。它们必须集中管理，原因是：
+
+- `reasoningSummary` 有些 OpenAI-compatible proxy 不认识。
+- Google thinking 用 `thinkingConfig`。
+- OpenRouter/Gateway 需要 usage/caching 路由参数。
+- Azure 和 OpenAI 的缓存字段并不完全一致。
+- 某些模型默认要开 thinking，否则拿不到 reasoning_content。
+
+Agent 不应该知道这些。Agent 只应该说“我要这个 model”，adapter 决定请求怎么写。
+
+### system prompt 放置差异
+
+`session/llm.ts` 先把系统提示词合并：
+
+```ts
+const system: string[] = []
+system.push(
+  [
+    ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+    ...input.system,
+    ...(input.user.system ? [input.user.system] : []),
+  ].filter((x) => x).join("\n"),
+)
+```
+
+但最终 messages 怎么放，要看 provider：
+
+```ts
+const messages = isOpenaiOauth
+  ? input.messages
+  : isWorkflow
+    ? input.messages
+    : [
+        ...system.map((x): ModelMessage => ({ role: "system", content: x })),
+        ...input.messages,
+      ]
+```
+
+OpenAI OAuth 特殊处理：
+
+```ts
+if (isOpenaiOauth) {
+  options.instructions = system.join("\n")
+}
+```
+
+GitLab workflow 也特殊：
+
+```ts
+if (language instanceof GitLabWorkflowLanguageModel) {
+  workflowModel.systemPrompt = system.join("\n")
+}
+```
+
+这说明“system prompt 放哪里”不是 Agent Loop 的职责。Agent Loop 只传 `system: string[]`，LLM adapter 决定它应该变成：
+
+- `messages[].role = "system"`
+- `options.instructions`
+- workflow model 的 `systemPrompt`
+- 或其他 provider 特定字段
+
+### 消息格式差异：ProviderTransform.message
+
+最终消息转换发生在 `wrapLanguageModel` middleware：
 
 ```ts
 model: wrapLanguageModel({
@@ -1437,31 +1644,364 @@ model: wrapLanguageModel({
 })
 ```
 
-### 讲透
+`ProviderTransform.message(...)` 做了多类转换。
 
-opencode 把 provider 差异集中在 `ProviderTransform` 和 `session/llm.ts` 的 adapter 层。Agent loop 只关心：
+第一类：过滤 provider 不支持的附件输入：
 
-- messages
-- tools
-- stream events
-- finish reason
+```ts
+function unsupportedParts(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
+  return msgs.map((msg) => {
+    if (msg.role !== "user" || !Array.isArray(msg.content)) return msg
+    const filtered = msg.content.map((part) => {
+      if (part.type !== "file" && part.type !== "image") return part
+      const modality = mimeToModality(mime)
+      if (!modality) return part
+      if (model.capabilities.input[modality]) return part
+      return {
+        type: "text",
+        text: `ERROR: Cannot read ${name} (this model does not support ${modality} input). Inform the user.`,
+      }
+    })
+    return { ...msg, content: filtered }
+  })
+}
+```
 
-这就是“运行时语义”和“供应商协议”的隔离。
+这避免了一个常见问题：用户传了图片，但当前模型不支持图片。如果直接发 provider，可能报 API error；adapter 把它转成文本错误，让模型能向用户解释。
 
-### 反例
+第二类：清理 Anthropic/Bedrock 不接受的空消息：
+
+```ts
+if (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/amazon-bedrock") {
+  msgs = msgs
+    .map((msg) => {
+      if (typeof msg.content === "string") {
+        if (msg.content === "") return undefined
+        return msg
+      }
+      ...
+    })
+    .filter((msg): msg is ModelMessage => msg !== undefined && msg.content !== "")
+}
+```
+
+第三类：修正 Claude toolCallId 字符限制：
+
+```ts
+if (model.api.id.includes("claude")) {
+  const scrub = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_")
+  ...
+  return { ...part, toolCallId: scrub(part.toolCallId) }
+}
+```
+
+第四类：修正 Anthropic tool_use 和文本顺序问题。源码注释明确说 Anthropic 会拒绝某些 shape：
+
+```ts
+// Anthropic rejects assistant turns where tool_use blocks are followed by non-tool
+// content, e.g. [tool_use, tool_use, text]
+```
+
+这些都不应该进入 Agent Loop。Agent Loop 不应该关心 Claude 是否允许 tool id 里有特殊字符，也不应该关心某个 provider 是否接受空字符串。
+
+### 缓存差异：同一个语义，不同字段
+
+ProviderTransform 还会根据 provider 加缓存控制：
+
+```ts
+function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
+  const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
+  const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
+
+  const providerOptions = {
+    anthropic: { cacheControl: { type: "ephemeral" } },
+    openrouter: { cacheControl: { type: "ephemeral" } },
+    bedrock: { cachePoint: { type: "default" } },
+    openaiCompatible: { cache_control: { type: "ephemeral" } },
+    copilot: { copilot_cache_control: { type: "ephemeral" } },
+  }
+  ...
+}
+```
+
+缓存是统一语义：“这些 system/final messages 值得缓存”。但 provider 字段完全不同。隔离层负责把统一语义翻译成 provider 字段。
+
+### 工具协议差异：Loop 看到统一 tools，adapter 处理供应商怪癖
+
+Agent Loop 只传 `tools`。但 `session/llm.ts` 里要处理 provider 特例。
+
+LiteLLM/Bedrock/GitHub Copilot 代理在历史里有 tool calls 但本轮 tools 为空时可能拒绝请求，所以 opencode 注入 `_noop`：
+
+```ts
+if (
+  (isLiteLLMProxy || input.model.providerID.includes("github-copilot")) &&
+  Object.keys(tools).length === 0 &&
+  hasToolCalls(input.messages)
+) {
+  tools["_noop"] = tool({
+    description: "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+    inputSchema: jsonSchema({ type: "object", properties: { reason: { type: "string" } } }),
+    execute: async () => ({ output: "", title: "", metadata: {} }),
+  })
+}
+```
+
+这很典型：这是 provider/proxy 的协议兼容问题，不是 Agent 任务逻辑。Agent 不应该知道“有历史 tool call 时必须带一个 dummy tool”。
+
+GitLab workflow 又是另一种工具协议：工具执行发生在 workflow service 的 WebSocket 流里，所以 adapter 要把 workflow 的 tool call 接回 opencode 工具系统：
+
+```ts
+workflowModel.toolExecutor = async (toolName, argsJson, requestID) => {
+  const t = tools[toolName]
+  if (!t || !t.execute) return { result: "", error: `Unknown tool: ${toolName}` }
+  const result = await t.execute(JSON.parse(argsJson), {
+    toolCallId: requestID,
+    messages: input.messages,
+    abortSignal: input.abort,
+  })
+  return { result: output, metadata: result?.metadata, title: result?.title }
+}
+```
+
+注意这里仍然没有绕过 opencode 的工具系统。workflow provider 的 tool call 最终还是执行 `tools[toolName].execute`，权限、metadata、输出回写仍保持 runtime 语义。
+
+### 权限差异：workflow approval 也要映射回 opencode Permission
+
+GitLab workflow 的审批不是普通 AI SDK tool call，所以 adapter 还要把它桥接到 opencode permission：
+
+```ts
+workflowModel.approvalHandler = Instance.bind(async (approvalTools) => {
+  const id = PermissionID.ascending()
+  await bridge.promise(
+    perm.ask({
+      id,
+      sessionID: SessionID.make(input.sessionID),
+      permission: "workflow_tool_approval",
+      patterns: uniquePatterns,
+      metadata: { tools: approvalTools },
+      always: uniquePatterns,
+      ruleset: [],
+    }),
+  )
+  return { approved: true }
+})
+```
+
+这体现了隔离层的另一条原则：provider 可以有自己的审批机制，但用户体验和运行时记录仍然要回到统一 Permission 系统。
+
+### 流式事件差异：统一交给 processor
+
+`session/llm.ts` 最终调用 AI SDK：
+
+```ts
+return streamText({
+  temperature: params.temperature,
+  topP: params.topP,
+  topK: params.topK,
+  providerOptions,
+  activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+  tools,
+  toolChoice: input.toolChoice,
+  maxOutputTokens: params.maxOutputTokens,
+  abortSignal: input.abort,
+  headers: requestHeaders,
+  messages,
+  model: wrapLanguageModel(...),
+})
+```
+
+上层 processor 看到的是 AI SDK `fullStream` 事件，而不是各 provider 原生 HTTP chunk。这让 processor 可以统一处理：
+
+- `text-delta`
+- `reasoning`
+- `tool-call`
+- `tool-result`
+- `finish`
+- `error`
+
+如果 processor 直接接 OpenAI SSE、Anthropic SSE、Gemini stream、workflow WebSocket，它就会变成 provider adapter，职责会崩。
+
+### 一个具体例子
+
+假设用户用 `gpt-5.4` provider 跑：
+
+```text
+帮我修 opencode_debug 日志，并打包安装。
+```
+
+Agent Loop 只需要产生统一输入：
+
+```ts
+{
+  system: ["agent prompt + env + instructions"],
+  messages: [user, assistant/tool history],
+  tools: { read, grep, edit, bash },
+  toolChoice: "auto",
+  model: "getrouter/gpt-5.4",
+}
+```
+
+如果换成 OpenAI 官方、OpenRouter、Azure、Anthropic、Gemini、GitLab workflow，Agent Loop 不应该改。变化应该只发生在 adapter：
+
+| 差异 | adapter 处理 |
+| --- | --- |
+| OpenAI OAuth 不把 system 放 messages | 写入 `options.instructions` |
+| Gateway 要拆 `gateway` 和 upstream provider options | `ProviderTransform.providerOptions` |
+| Claude tool id 不允许特殊字符 | `ProviderTransform.message` scrub |
+| Anthropic 不接受空 content | `normalizeMessages` 过滤 |
+| 模型不支持图片 | `unsupportedParts` 转成文本错误 |
+| LiteLLM 历史有 tool call 但本轮没 tools 会报错 | 注入 `_noop` |
+| GitLab workflow 工具调用走 WebSocket | `workflowModel.toolExecutor` 桥接 |
+| Azure provider options 路径不稳定 | 同时写 `openai` 和 `azure` |
+
+这样 debug 时也能分层判断：
+
+- 如果 Agent 选错工具，是 Agent/Prompt 问题。
+- 如果 tool result 没回写，是 processor/tool 问题。
+- 如果请求被 provider 拒绝，是 adapter/ProviderTransform 问题。
+- 如果参数无效，是 options/providerOptions 映射问题。
+
+### 反例：Provider 分支污染 Agent Loop
 
 不要在 agent loop 里写：
 
 ```ts
-if (model.includes("gpt")) messages = convertOpenAI(messages)
-if (model.includes("claude")) messages = convertAnthropic(messages)
+if (model.id.includes("gpt-5")) {
+  options.reasoningEffort = "medium"
+  options.reasoningSummary = "auto"
+}
+
+if (model.id.includes("claude")) {
+  messages = scrubClaudeToolIds(messages)
+  messages = reorderAnthropicToolUse(messages)
+}
+
+if (provider.id.includes("litellm") && hasToolCalls(messages) && Object.keys(tools).length === 0) {
+  tools._noop = makeNoopTool()
+}
+
+const result = await streamText({ messages, tools, options })
 ```
+
+这种写法短期能跑，长期一定失控。因为 Agent Loop 本来应该只决定“下一步是否继续、用哪些工具、如何处理会话状态”，却开始承担 provider 协议转换。最后任何 provider bug 都会变成 Agent bug。
 
 应该写：
 
 ```ts
-const providerPrompt = ProviderTransform.message(messages, model, options)
+const streamInput = {
+  user,
+  sessionID,
+  model,
+  agent,
+  system,
+  messages,
+  tools,
+  toolChoice,
+}
+
+const events = llm.stream(streamInput)
 ```
+
+然后在 LLM adapter 内部做：
+
+```ts
+const base = ProviderTransform.options({ model, sessionID, providerOptions })
+const options = mergeProviderModelAgentVariantOptions(base, model, agent, variant)
+const providerOptions = ProviderTransform.providerOptions(model, options)
+const providerMessages = ProviderTransform.message(messages, model, options)
+return streamText({ messages: providerMessages, providerOptions, tools })
+```
+
+### 分层图
+
+```mermaid
+flowchart TD
+  A["Agent Loop 统一语义"] --> B["LLM StreamInput"]
+  B --> C["session/llm.ts adapter"]
+  C --> D["合并 options: base < model < agent < variant"]
+  C --> E["system placement: messages / instructions / workflow"]
+  C --> F["tool adapter: noop / workflow executor / repair"]
+  D --> G["ProviderTransform.providerOptions"]
+  E --> H["ProviderTransform.message"]
+  F --> I["AI SDK streamText"]
+  G --> I
+  H --> I
+  I --> J["AI SDK fullStream events"]
+  J --> K["processor 统一落 MessageV2 parts"]
+```
+
+这张图的关键是单向依赖：Agent Loop 依赖 LLM 统一接口，LLM adapter 依赖 ProviderTransform，ProviderTransform 才知道供应商细节。不要让箭头倒过来。
+
+### 从 0 设计建议
+
+不要让每个 provider 实现一个完整 Agent。应该设计三层：
+
+```ts
+type AgentRequest = {
+  sessionID: string
+  system: string[]
+  messages: ModelMessage[]
+  tools: ToolSet
+  model: ModelRef
+  toolChoice?: "auto" | "required" | "none"
+}
+
+type ProviderAdapter = {
+  buildOptions(request: AgentRequest): ProviderOptions
+  transformMessages(messages: ModelMessage[], model: ModelRef): ProviderMessage[]
+  stream(request: AgentRequest): AsyncIterable<UnifiedStreamEvent>
+}
+
+type UnifiedStreamEvent =
+  | { type: "text-delta"; text: string }
+  | { type: "reasoning"; text: string; metadata?: unknown }
+  | { type: "tool-call"; callID: string; name: string; input: unknown }
+  | { type: "tool-result"; callID: string; output: unknown }
+  | { type: "finish"; reason: string; usage?: TokenUsage }
+  | { type: "error"; error: unknown }
+```
+
+Agent Loop 只使用 `AgentRequest` 和 `UnifiedStreamEvent`。ProviderAdapter 内部再处理：
+
+```ts
+class OpenAIAdapter implements ProviderAdapter {
+  buildOptions(req) {
+    return {
+      openai: {
+        store: false,
+        reasoningEffort: req.model.reasoning ? "medium" : undefined,
+        promptCacheKey: req.sessionID,
+      },
+    }
+  }
+}
+
+class AnthropicAdapter implements ProviderAdapter {
+  transformMessages(messages, model) {
+    return applyCaching(scrubToolIds(removeEmptyMessages(messages)), model)
+  }
+}
+```
+
+这样你以后新增 provider，是加 adapter，不是改 Agent Loop。
+
+### 判断是否设计到位的检查清单
+
+设计自己的 AI 代码助手时，可以用这份清单验收 provider 隔离：
+
+- Agent Loop 是否完全不知道 OpenAI/Anthropic/Gemini 的请求字段。
+- provider/model 默认参数是否集中在一个 transform/options 层。
+- 参数合并是否有清晰优先级：provider default、model、agent、variant、runtime。
+- system prompt 放置是否由 adapter 决定，而不是 Agent Loop 到处拼。
+- providerOptions namespace 是否集中映射，而不是调用处手写。
+- 消息格式修正是否集中处理，例如空消息、tool id、unsupported media、tool_use 顺序。
+- 工具协议兼容是否在 adapter 层，例如 `_noop`、workflow executor、tool repair。
+- provider 特有审批是否桥接回统一 Permission 系统。
+- 上层 processor 是否只消费统一 stream event，而不是 provider 原生 chunk。
+- 日志是否同时打印统一输入和转换后的 provider prompt/options，方便定位问题属于 Agent 还是 adapter。
+- 新增 provider 是否只需要加 provider 配置和 transform 分支，而不用改 Agent Loop。
+
+做到这些，才算真正讲清楚“Provider 差异会污染 Agent 逻辑，必须隔离”。否则多模型支持越多，Agent 核心越脆。
 
 ## 5. 难点五：工具不是函数，它是带权限、schema、截断、元数据的动作
 
