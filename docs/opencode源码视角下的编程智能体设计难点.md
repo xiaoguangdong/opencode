@@ -2013,7 +2013,9 @@ class AnthropicAdapter implements ProviderAdapter {
 weather(city)
 ```
 
-但编程智能体的工具有真实副作用：
+这个示例会让人误以为工具就是“模型决定调用一个函数，函数返回字符串”。在编程智能体里，这是远远不够的。工具是一个受控动作，它会改变世界、改变会话状态、改变权限状态，还要把过程暴露给 UI 和日志。
+
+编程智能体的工具有真实副作用：
 
 - 读文件
 - 改文件
@@ -2023,11 +2025,26 @@ weather(city)
 - 创建子任务
 - 加载 skill
 
-每个工具都需要 schema、权限、上下文、取消、输出截断和消息回写。
+每个工具至少要解决这些问题：
+
+| 问题 | 如果不解决会怎样 |
+| --- | --- |
+| 参数 schema | 模型给错参数时直接崩，无法反馈给模型修正 |
+| 权限审批 | 模型可能随意改文件、执行 shell、访问外部目录 |
+| 执行上下文 | 工具不知道 session、message、callID，结果无法挂回会话 |
+| 运行中状态 | UI 只能看到“卡住了”，不知道工具在干什么 |
+| 取消信号 | 用户取消后后台命令还在跑 |
+| 输出截断 | 一次 grep/bash 输出把上下文塞爆 |
+| metadata | 用户看不到 diff、文件路径、命令标题、截断位置 |
+| attachments | MCP/image/resource 无法进入统一消息系统 |
+| 错误回写 | 工具失败变成进程异常，而不是模型可读的 tool error |
+| 防死循环 | 模型重复调用同一工具，消耗 token 和时间 |
+
+所以工具不是函数，而是“带协议、权限、状态和审计的动作”。
 
 ### opencode 源码落点
 
-工具抽象在 `tool/tool.ts`：
+工具抽象在 `tool/tool.ts`。核心不是 `execute(args)`，而是 `Context` 和 `ExecuteResult`：
 
 ```ts
 export type Context = {
@@ -2039,6 +2056,13 @@ export type Context = {
   messages: MessageV2.WithParts[]
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>
   ask(input: Omit<Permission.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
+}
+
+export interface ExecuteResult<M extends Metadata = Metadata> {
+  title: string
+  metadata: M
+  output: string
+  attachments?: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[]
 }
 ```
 
@@ -2056,17 +2080,514 @@ toolInfo.execute = (args, ctx) => {
 }
 ```
 
-### 讲透
+这段代码解决两类问题：
 
-这个设计把工具调用变成了“受控动作”：
+- 工具执行前：参数必须通过 zod schema，否则返回模型可修正的错误。
+- 工具执行后：输出必须截断，并把 `truncated/outputPath` 写进 metadata。
 
-- `parameters.parse(args)` 保证模型参数错了能反馈给模型修正。
-- `ctx.ask(...)` 让工具自己声明需要什么权限。
-- `metadata(...)` 可以把工具执行标题、状态写回 message part。
-- `abort` 支持用户取消。
-- `truncate.output` 防止工具输出塞爆上下文。
+### 工具注册：不是所有工具都直接暴露给模型
+
+工具进入模型前，要经过 `session/prompt.ts` 的 `resolveTools(...)`：
+
+```ts
+const resolveTools = Effect.fn("SessionPrompt.resolveTools")(function* (input) {
+  const tools: Record<string, AITool> = {}
+
+  for (const item of yield* registry.tools({
+    modelID: ModelID.make(input.model.api.id),
+    providerID: input.model.providerID,
+    agent: input.agent,
+  })) {
+    const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
+    tools[item.id] = tool({
+      description: item.description,
+      inputSchema: jsonSchema(schema),
+      execute(args, options) { ... },
+    })
+  }
+
+  for (const [key, item] of Object.entries(yield* mcp.tools())) {
+    ...
+  }
+})
+```
+
+这里有三个关键点：
+
+1. 工具来自 registry，而不是硬编码在 loop 里。
+2. 工具 schema 会经过 `ProviderTransform.schema(...)`，因为不同模型对 JSON schema 支持不同。
+3. MCP 工具也被归一化成同一套 AI SDK tool。
+
+真正传给 AI SDK 前，`session/llm.ts` 还会再次过滤：
+
+```ts
+function resolveTools(input: Pick<StreamInput, "tools" | "agent" | "permission" | "user">) {
+  const disabled = Permission.disabled(
+    Object.keys(input.tools),
+    Permission.merge(input.agent.permission, input.permission ?? []),
+  )
+  return Record.filter(input.tools, (_, k) => input.user.tools?.[k] !== false && !disabled.has(k))
+}
+```
+
+所以“模型能看到哪些工具”不是工具注册表单独决定的，而是：
+
+```text
+registry/mcp tools
+  -> provider schema transform
+  -> agent permission
+  -> session permission
+  -> user per-turn tools override
+  -> final active tools
+```
+
+这就避免了“工具存在就一定能调用”的安全问题。
+
+### 执行上下文：工具知道自己属于哪次调用
+
+`resolveTools` 给每次工具执行创建 `Tool.Context`：
+
+```ts
+const context = (args, options): Tool.Context => ({
+  sessionID: input.session.id,
+  abort: options.abortSignal!,
+  messageID: input.processor.message.id,
+  callID: options.toolCallId,
+  extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
+  agent: input.agent.name,
+  messages: input.messages,
+  metadata: (val) =>
+    input.processor.updateToolCall(options.toolCallId, (match) => ({
+      ...match,
+      state: {
+        title: val.title,
+        metadata: val.metadata,
+        status: "running",
+        input: args,
+        time: { start: Date.now() },
+      },
+    })),
+  ask: (req) =>
+    permission.ask({
+      ...req,
+      sessionID: input.session.id,
+      tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+      ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+    }),
+})
+```
+
+这就是工具和普通函数的根本区别。普通函数只拿 `args`；opencode 工具还拿：
+
+- `sessionID`：结果属于哪个会话
+- `messageID`：结果挂到哪条 assistant message
+- `callID`：结果对应哪个模型 tool call
+- `abort`：用户取消时怎么停止
+- `messages`：工具需要历史上下文时可以读
+- `metadata`：运行中更新 UI 状态
+- `ask`：执行危险动作前请求权限
+
+没有这些上下文，工具就只是一个函数；有了这些上下文，工具才是 runtime action。
+
+### 权限不是模型问用户，而是工具声明风险
+
+工具内部调用 `ctx.ask(...)`。例如 bash：
+
+```ts
+yield* ctx.ask({
+  permission: "bash",
+  patterns: Array.from(scan.patterns),
+  always: Array.from(scan.always),
+  metadata: {},
+})
+```
+
+edit 工具会把 diff 放进 metadata：
+
+```ts
+yield* ctx.ask({
+  permission: "edit",
+  patterns: [path.relative(Instance.worktree, filePath)],
+  always: ["*"],
+  metadata: {
+    filepath: filePath,
+    diff,
+  },
+})
+```
+
+这比让模型说“我要不要修改文件？”可靠得多。模型只负责选择工具；工具根据真实参数声明风险；Permission 系统根据规则决定 allow/deny/ask。
+
+Permission 的核心评估在 `permission/index.ts`：
+
+```ts
+for (const pattern of request.patterns) {
+  const rule = evaluate(request.permission, pattern, ruleset, approved)
+  if (rule.action === "deny") {
+    return yield* new DeniedError(...)
+  }
+  if (rule.action === "allow") continue
+  needsAsk = true
+}
+
+if (!needsAsk) return
+
+yield* bus.publish(Event.Asked, info)
+return yield* Deferred.await(deferred)
+```
+
+这说明权限不是 prompt 约定，而是 runtime 阻塞点：
+
+- allow：直接执行
+- deny：工具失败
+- ask：发布事件给 UI/TUI，等待用户回复
+
+### 工具生命周期：pending -> running -> completed/error
+
+模型开始组织工具输入时，processor 会创建 pending tool part：
+
+```ts
+case "tool-input-start":
+  const part = yield* session.updatePart({
+    type: "tool",
+    tool: value.toolName,
+    callID: value.id,
+    state: { status: "pending", input: {}, raw: "" },
+    metadata: value.providerExecuted ? { providerExecuted: true } : undefined,
+  })
+```
+
+模型真正发起 tool call 后，状态变成 running：
+
+```ts
+case "tool-call":
+  yield* updateToolCall(value.toolCallId, (match) => ({
+    ...match,
+    tool: value.toolName,
+    state: {
+      ...match.state,
+      status: "running",
+      input: value.input,
+      time: { start: Date.now() },
+    },
+    metadata: value.providerMetadata,
+  }))
+```
+
+工具执行成功后，`completeToolCall` 写 completed：
+
+```ts
+yield* session.updatePart({
+  ...match.part,
+  state: {
+    status: "completed",
+    input: match.part.state.input,
+    output: output.output,
+    metadata: output.metadata,
+    title: output.title,
+    time: { start: match.part.state.time.start, end: Date.now() },
+    attachments: output.attachments,
+  },
+})
+```
+
+失败则写 error：
+
+```ts
+yield* session.updatePart({
+  ...match.part,
+  state: {
+    status: "error",
+    input: match.part.state.input,
+    error: errorMessage(error),
+    time: { start: match.part.state.time.start, end: Date.now() },
+  },
+})
+```
+
+这套状态机让 UI、日志、恢复和下一轮模型都知道工具发生了什么。没有它，用户只能看到最终文本，完全不知道中间执行链路。
+
+### 完整生命周期图
+
+```mermaid
+flowchart TD
+  A["模型生成 tool-input-start"] --> B["processor 创建 ToolPart pending"]
+  B --> C["模型生成 tool-call + 参数"]
+  C --> D["processor 更新 ToolPart running"]
+  D --> E["AI SDK 调用 tool.execute"]
+  E --> F["Tool.Context 创建 session/message/callID"]
+  F --> G{"ctx.ask 权限检查"}
+  G -- deny --> H["failToolCall: state=error"]
+  G -- ask --> I["permission.asked -> UI/TUI 等待回复"]
+  I -- reject --> H
+  I -- allow --> J["执行真实副作用"]
+  G -- allow --> J
+  J --> K["ctx.metadata 更新 running title/metadata"]
+  K --> L["工具返回 output/attachments"]
+  L --> M["truncate.output 截断输出"]
+  M --> N["completeToolCall: state=completed"]
+  N --> O["下一轮 loop 把 tool result 回喂模型"]
+```
+
+这张图说明：工具调用不是同步函数返回，而是跨越模型流、权限系统、工具执行、消息持久化和下一轮上下文的完整协议。
+
+### 输出截断：不能把 stdout 原样塞回上下文
+
+`tool/tool.ts` 包装所有内置工具输出：
+
+```ts
+const result = yield* execute(args, ctx)
+if (result.metadata.truncated !== undefined) return result
+const agent = yield* agents.get(ctx.agent)
+const truncated = yield* truncate.output(result.output, {}, agent)
+return {
+  ...result,
+  output: truncated.content,
+  metadata: {
+    ...result.metadata,
+    truncated: truncated.truncated,
+    ...(truncated.truncated && { outputPath: truncated.outputPath }),
+  },
+}
+```
+
+这解决两个冲突目标：
+
+- 模型需要看到足够输出，才能继续推理。
+- 上下文不能被巨大输出撑爆。
+
+关键不是简单截断，而是把 `outputPath` 写进 metadata。这样模型和用户看到的是摘要，人类排查时还能找到完整输出。
+
+MCP 工具也走类似逻辑：
+
+```ts
+const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
+const metadata = {
+  ...result.metadata,
+  truncated: truncated.truncated,
+  ...(truncated.truncated && { outputPath: truncated.outputPath }),
+}
+```
+
+所以不管是内置工具还是 MCP 工具，最终都进入统一截断策略。
+
+### attachments：工具不只返回文本
+
+`ExecuteResult` 支持 attachments：
+
+```ts
+attachments?: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[]
+```
+
+MCP 结果会把 image/resource blob 转成 file attachment：
+
+```ts
+if (contentItem.type === "image") {
+  attachments.push({
+    type: "file",
+    mime: contentItem.mimeType,
+    url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
+  })
+}
+```
+
+这让工具结果能统一进入 MessageV2，而不是每种工具自己发明返回格式。
+
+### metadata：工具执行过程要可见
+
+工具可以在执行过程中调用 `ctx.metadata(...)`。例如 bash/edit 会更新 title、diff、运行状态。metadata 最终进入 `ToolPart.state.metadata`。
+
+它的价值是：
+
+- TUI 能显示“正在运行哪个命令/正在编辑哪个文件”。
+- 权限弹窗能展示 diff 或路径。
+- 日志能从 callID 追到工具参数和输出。
+- 最终 transcript 能解释发生过什么。
+
+没有 metadata，工具执行就变成黑盒。
+
+### 防死循环：工具调用也要有运行时护栏
+
+processor 在 `tool-call` 时会检查最近工具调用：
+
+```ts
+const parts = MessageV2.parts(ctx.assistantMessage.id)
+const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
+
+if (
+  recentParts.length === DOOM_LOOP_THRESHOLD &&
+  recentParts.every(
+    (part) =>
+      part.type === "tool" &&
+      part.tool === value.toolName &&
+      part.state.status !== "pending" &&
+      JSON.stringify(part.state.input) === JSON.stringify(value.input),
+  )
+) {
+  yield* permission.ask({
+    permission: "doom_loop",
+    patterns: [value.toolName],
+    metadata: { tool: value.toolName, input: value.input },
+  })
+}
+```
+
+这是非常实际的编程智能体问题。模型可能反复执行：
+
+```text
+grep "FlowLog" packages/opencode/src
+grep "FlowLog" packages/opencode/src
+grep "FlowLog" packages/opencode/src
+...
+```
+
+没有 doom loop 防护，系统会一直烧 token 和时间。opencode 把重复工具调用升级成权限问题，让用户决定是否继续。
+
+### 一个具体例子
+
+假设模型决定修日志，需要调用 edit：
+
+```ts
+edit({
+  filePath: "packages/opencode/src/session/prompt.ts",
+  oldString: "trace.info(...)",
+  newString: "trace.info(...更多字段...)",
+})
+```
+
+真实执行链不是 `edit(args)` 这么简单，而是：
+
+1. AI SDK 发出 `tool-input-start`，processor 创建 pending tool part。
+2. AI SDK 发出 `tool-call`，processor 写入 input，状态变 running。
+3. `resolveTools` 创建 `Tool.Context`，带上 `sessionID/messageID/callID/abort/messages`。
+4. edit 工具读取文件并生成 diff。
+5. edit 工具调用 `ctx.ask({ permission: "edit", patterns: [file], metadata: { diff } })`。
+6. Permission 根据 agent/session/user ruleset 判断 allow/deny/ask。
+7. 允许后 edit 写文件、格式化、发布 File.Event。
+8. 工具返回 output、title、metadata。
+9. wrapper 执行 `truncate.output`。
+10. processor `completeToolCall` 把 completed state 写入 MessageV2。
+11. 下一轮 Agent Loop 把 tool result 转成 model message，让模型继续。
+
+这才是“工具调用”的工程全貌。
+
+### 内置工具和 MCP 工具的统一点
+
+内置工具和 MCP 工具来源不同，但最终都要满足同一个运行时协议：
+
+| 能力 | 内置工具 | MCP 工具 |
+| --- | --- | --- |
+| schema | zod parameters | MCP inputSchema -> jsonSchema |
+| provider schema 修正 | `ProviderTransform.schema` | `ProviderTransform.schema` |
+| 执行前 hook | `tool.execute.before` | `tool.execute.before` |
+| 权限 | 工具内部 `ctx.ask` | prompt 层统一 `ctx.ask({ permission: key })` |
+| 输出截断 | `tool/tool.ts` wrapper | MCP result 归一化后 truncate |
+| attachments | `ExecuteResult.attachments` | image/resource -> file attachment |
+| 消息回写 | processor ToolPart | processor ToolPart |
+
+这说明 MCP 不是绕过工具系统，而是接入工具系统。
+
+### 从 0 设计建议
+
+不要写成：
+
+```ts
+const tools = {
+  bash: async ({ command }) => exec(command),
+  edit: async ({ file, text }) => fs.writeFile(file, text),
+}
+```
+
+至少要设计成：
+
+```ts
+type ToolContext = {
+  sessionID: string
+  messageID: string
+  callID: string
+  abort: AbortSignal
+  messages: MessageWithParts[]
+  ask(req: PermissionRequest): Promise<void>
+  metadata(update: { title?: string; metadata?: Record<string, unknown> }): Promise<void>
+}
+
+type ToolResult = {
+  title: string
+  output: string
+  metadata: Record<string, unknown>
+  attachments?: FilePart[]
+}
+
+type ToolDef<T> = {
+  id: string
+  description: string
+  schema: ZodSchema<T>
+  execute(args: T, ctx: ToolContext): Promise<ToolResult>
+}
+```
+
+执行器要包一层：
+
+```ts
+async function runTool<T>(tool: ToolDef<T>, rawArgs: unknown, ctx: ToolContext) {
+  const args = tool.schema.parse(rawArgs)
+  await updateToolPart(ctx.callID, { status: "running", input: args })
+
+  try {
+    const result = await tool.execute(args, ctx)
+    const output = await truncateOutput(result.output)
+    await completeToolPart(ctx.callID, { ...result, output: output.content, metadata: output.metadata })
+    return result
+  } catch (error) {
+    await failToolPart(ctx.callID, error)
+    throw error
+  }
+}
+```
+
+危险工具内部必须自己声明权限：
+
+```ts
+const editTool: ToolDef<EditArgs> = {
+  id: "edit",
+  description: "Edit a file",
+  schema: EditArgs,
+  async execute(args, ctx) {
+    const diff = await previewDiff(args)
+    await ctx.ask({
+      permission: "edit",
+      patterns: [args.filePath],
+      always: ["*"],
+      metadata: { diff, filepath: args.filePath },
+    })
+    await applyEdit(args)
+    return { title: args.filePath, output: "File edited", metadata: { filepath: args.filePath } }
+  },
+}
+```
+
+### 判断是否设计到位的检查清单
+
+设计自己的 AI 代码助手时，可以用这份清单验收工具系统：
+
+- 每个工具是否有 schema，并且参数错误会反馈给模型而不是 crash。
+- 工具执行是否有 `sessionID/messageID/callID`，结果能挂回对应 assistant message。
+- 工具是否能更新 running metadata，让 UI/日志看到执行中状态。
+- 危险工具是否在工具内部按真实参数调用权限系统。
+- 权限规则是否支持 allow/deny/ask，而不是只有全局开关。
+- 用户取消时工具是否能收到 abort signal。
+- 工具结果是否统一写成 ToolPart 的 pending/running/completed/error 状态。
+- 工具输出是否统一截断，并保留 `outputPath` 这类可追踪元数据。
+- 工具是否支持 attachments，而不是只支持字符串。
+- MCP/外部工具是否进入同一套 schema、权限、截断、消息回写协议。
+- 是否有重复工具调用或 doom loop 防护。
+- 日志是否能从 `sessionID/messageID/callID/tool` 追到参数、权限、输出和错误。
+
+做到这些，才算真正讲清楚“工具不是函数，它是带权限、schema、截断、元数据的动作”。否则工具越多，系统越像一组危险的远程函数调用。
 
 ### 设计示例
+
+一个安全的 edit 工具最小形态是：
 
 ```ts
 const tool: Tool = {
@@ -2079,6 +2600,8 @@ const tool: Tool = {
   },
 }
 ```
+
+关键不在 `applyPatch(args)`，而在它前后的协议：schema 校验、diff metadata、permission ask、状态回写、输出截断、callID 追踪。少任何一项，工具系统都会在真实编程任务里失控。
 
 ## 6. 难点六：MCP 接入不是“多几个工具”，而是外部能力边界
 
