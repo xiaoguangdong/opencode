@@ -1242,3 +1242,770 @@ export async function runAgent(input: {
 | 反思有限 | 反思最多 1-2 次，不能替代测试 |
 | 上下文可控 | 重要信息优先，超长输出落盘 |
 | 评测先行 | 每次改 loop 都跑回归集 |
+
+## opencode 里的 Agentic RAG 是怎么实现的
+
+先下结论：`opencode` 当前的 Agentic RAG，核心不是“预先建一个向量库，再把 top-k 文档塞给模型”，而是：
+
+1. 先注入运行环境和系统指令。
+2. 让模型自己决定何时调用 `glob` / `grep` / `read` / `task`。
+3. 工具把检索结果写回会话历史。
+4. 下一轮把这些工具结果重新编码成 `ModelMessage[]` 再发给模型。
+5. 如果上下文过长，再触发 compaction，把旧上下文压成摘要后继续检索。
+
+也就是说，`opencode` 的 RAG 是一个 **Agent 驱动的、分步检索的、会话内增量构造上下文的检索系统**。它更接近“runtime retrieval loop”，而不是“静态知识库召回”。
+
+### 1. 先看整体图
+
+```mermaid
+flowchart TD
+  U["用户问题"] --> P["SessionPrompt.loop"]
+  P --> S["SystemPrompt.environment + skills"]
+  P --> I["Instruction.system<br/>加载 AGENTS.md / CLAUDE.md / 配置指令"]
+  P --> H["MessageV2.toModelMessagesEffect<br/>历史消息转模型消息"]
+  S --> L["LLM.stream"]
+  I --> L
+  H --> L
+  L --> C{"模型输出"}
+  C -->|文本| R1["写入 assistant text part"]
+  C -->|tool call| X["SessionProcessor 记录 tool part"]
+  X --> T["resolveTools + ToolRegistry"]
+  T --> G["glob / grep / read / task / MCP"]
+  G --> W["工具结果写回 PartTable"]
+  W --> H2["下一轮再次 toModelMessagesEffect"]
+  H2 --> L
+  L --> O{"上下文是否溢出"}
+  O -->|否| F["输出最终答案"]
+  O -->|是| CMP["SessionCompaction.create/process"]
+  CMP --> H2
+```
+
+这个图里最关键的是两条回路：
+
+- **检索回路**：模型发工具调用，工具结果写回会话，再进入下一轮模型推理。
+- **压缩回路**：上下文超长时先 compact，再继续检索和推理。
+
+### 2. 这套 RAG 的五个核心组件
+
+| 组件 | 代码位置 | 作用 |
+| --- | --- | --- |
+| 系统指令召回 | `packages/opencode/src/session/instruction.ts` | 自动加载 `AGENTS.md`、`CLAUDE.md`、配置指令 |
+| 检索工具 | `packages/opencode/src/tool/glob.ts` `grep.ts` `read.ts` `task.ts` | 文件召回、内容召回、精读、子代理检索 |
+| 工具装配 | `packages/opencode/src/session/prompt.ts` `packages/opencode/src/tool/registry.ts` | 把工具变成模型可调用的 schema |
+| 结果回灌 | `packages/opencode/src/session/message-v2.ts` | 把完成的工具结果重编码进下一轮 `ModelMessage[]` |
+| Agent 循环 | `packages/opencode/src/session/processor.ts` `llm.ts` `prompt.ts` | 驱动多轮“检索 -> 理解 -> 再检索 -> 回答” |
+
+---
+
+## 真实实现 1：系统级检索不是向量召回，而是指令文件自动注入
+
+很多人讲 RAG 时只想到“业务知识库”。但在 `opencode` 里，第一层 retrieval 是 **运行时指令检索**。
+
+入口在 `packages/opencode/src/session/instruction.ts`：
+
+```ts
+const FILES = [
+  "AGENTS.md",
+  ...(Flag.OPENCODE_DISABLE_CLAUDE_CODE_PROMPT ? [] : ["CLAUDE.md"]),
+  "CONTEXT.md",
+]
+```
+
+系统会向上查找项目里的这些文件，再叠加全局配置里的指令文件：
+
+```ts
+const systemPaths = Effect.fn("Instruction.systemPaths")(function* () {
+  const config = yield* cfg.get()
+  const ctx = yield* InstanceState.context
+  const paths = new Set<string>()
+
+  if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
+    for (const file of FILES) {
+      const matches = yield* fs.findUp(file, ctx.directory, ctx.worktree)
+      if (matches.length > 0) {
+        matches.forEach((item) => paths.add(path.resolve(item)))
+        break
+      }
+    }
+  }
+
+  for (const file of globalFiles()) {
+    if (yield* fs.existsSafe(file)) {
+      paths.add(path.resolve(file))
+      break
+    }
+  }
+```
+
+然后真正把内容读出来：
+
+```ts
+const system = Effect.fn("Instruction.system")(function* () {
+  const config = yield* cfg.get()
+  const paths = yield* systemPaths()
+  const urls = (config.instructions ?? []).filter(
+    (item) => item.startsWith("https://") || item.startsWith("http://"),
+  )
+
+  const files = yield* Effect.forEach(Array.from(paths), read, { concurrency: 8 })
+  const remote = yield* Effect.forEach(urls, fetch, { concurrency: 4 })
+
+  return [
+    ...Array.from(paths).flatMap((item, i) => (files[i] ? [`Instructions from: ${item}\n${files[i]}`] : [])),
+    ...urls.flatMap((item, i) => (remote[i] ? [`Instructions from: ${item}\n${remote[i]}`] : [])),
+  ]
+})
+```
+
+这一步的意义非常大：
+
+- 它把“项目规则”当成第一类可检索知识。
+- 它不是让模型靠记忆猜规范，而是把规范作为运行时上下文显式注入。
+- 这一步其实已经是 RAG，只不过检索对象不是业务文档，而是 agent 运行规则。
+
+---
+
+## 真实实现 2：`read` 不是简单读文件，它会顺带召回附近指令
+
+`read` 工具是 `opencode` 里最关键的“精读器”。它除了读文件，还会自动把和这个文件相邻的指令文件一起召回。
+
+在 `packages/opencode/src/tool/read.ts`：
+
+```ts
+const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
+```
+
+而 `instruction.resolve()` 的逻辑在 `packages/opencode/src/session/instruction.ts`：
+
+```ts
+const resolve = Effect.fn("Instruction.resolve")(function* (
+  messages: MessageV2.WithParts[],
+  filepath: string,
+  messageID: MessageID,
+) {
+  const sys = yield* systemPaths()
+  const already = extract(messages)
+  const results: { filepath: string; content: string }[] = []
+  const s = yield* InstanceState.get(state)
+  const root = path.resolve(yield* InstanceState.directory)
+
+  const target = path.resolve(filepath)
+  let current = path.dirname(target)
+
+  while (current.startsWith(root) && current !== root) {
+    const found = yield* find(current)
+    if (!found || found === target || sys.has(found) || already.has(found)) {
+      current = path.dirname(current)
+      continue
+    }
+```
+
+也就是说，当模型读取某个文件时，系统会：
+
+1. 从这个文件所在目录开始向上走。
+2. 看旁边有没有 `AGENTS.md` / `CLAUDE.md` / `CONTEXT.md`。
+3. 如果没注入过，就把这些指令追加到当前读取结果里。
+
+这和传统 RAG 非常不同：
+
+- 传统 RAG：先检索语义相似文档。
+- `opencode`：先检索“和当前编辑对象邻近的操作规则”。
+
+这是一个非常工程化的设计，因为代码任务里最重要的信息经常不是“语义最像的文档”，而是“这个目录下到底有没有特殊规矩”。
+
+---
+
+## 真实实现 3：召回主力是 `glob` + `grep` + `read`，底层用 ripgrep
+
+### `glob`：先把候选文件集合找出来
+
+`packages/opencode/src/tool/glob.ts`：
+
+```ts
+const files = yield* rg.files({ cwd: search, glob: [params.pattern], signal: ctx.abort }).pipe(
+  Stream.mapEffect((file) =>
+    Effect.gen(function* () {
+      const full = path.resolve(search, file)
+      const info = yield* fs.stat(full).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const mtime =
+        info?.mtime.pipe(
+          Option.map((date) => date.getTime()),
+          Option.getOrElse(() => 0),
+        ) ?? 0
+      return { path: full, mtime }
+    }),
+  ),
+  Stream.take(limit + 1),
+  Stream.runCollect,
+  Effect.map((chunk) => [...chunk]),
+)
+```
+
+特点：
+
+- 不是自己写文件遍历，而是直接复用 `Ripgrep.Service`。
+- 返回结果按 `mtime` 排序，最近改过的文件优先。
+- 有 `limit` 和 `truncated`，防止一次塞太多。
+
+### `grep`：在候选集合里做内容召回
+
+`packages/opencode/src/tool/grep.ts`：
+
+```ts
+const result = yield* rg.search({
+  cwd,
+  pattern: params.pattern,
+  glob: params.include ? [params.include] : undefined,
+  file,
+  signal: ctx.abort,
+})
+```
+
+得到命中后，会保留路径、行号和文本：
+
+```ts
+const rows = result.items.map((item) => ({
+  path: AppFileSystem.resolve(
+    path.isAbsolute(item.path.text) ? item.path.text : path.join(cwd, item.path.text),
+  ),
+  line: item.line_number,
+  text: item.lines.text,
+}))
+```
+
+这一步很像传统 RAG 的“粗召回”：
+
+- `glob` 先找文件范围。
+- `grep` 再找命中文本位置。
+- `read` 再做精读。
+
+只是 `opencode` 没有把这三步固化成固定 pipeline，而是交给模型自己决定顺序和次数。
+
+### `read`：最后做精读
+
+`packages/opencode/src/tool/read.ts`：
+
+```ts
+const file = yield* Effect.promise(() =>
+  lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset ?? 1 }),
+)
+
+let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
+```
+
+这个输出很关键：
+
+- 带绝对路径。
+- 带行号。
+- 长文件支持 `offset + limit` 分块续读。
+- 输出是结构化的 `<path> / <type> / <content>`。
+
+这意味着模型拿到的不是“模糊摘要”，而是 **可继续精确引用的源代码片段**。
+
+---
+
+## 真实实现 4：广义检索可以升级为 `task` 子代理检索
+
+如果问题是开放式的、多轮的，`opencode` 不要求主模型自己反复 `glob` / `grep`，它可以直接调用 `task` 把搜索工作委托给子代理。
+
+`packages/opencode/src/tool/task.ts`：
+
+```ts
+const parameters = z.object({
+  description: z.string().describe("A short (3-5 words) description of the task"),
+  prompt: z.string().describe("The task for the agent to perform"),
+  subagent_type: z.string().describe("The type of specialized agent to use for this task"),
+  task_id: z.string().optional(),
+  command: z.string().optional(),
+})
+```
+
+真正执行时，会创建或恢复一个子 session：
+
+```ts
+const taskID = params.task_id
+const session = taskID
+  ? yield* sessions.get(SessionID.make(taskID)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+  : undefined
+const nextSession =
+  session ??
+  (yield* sessions.create({
+    parentID: ctx.sessionID,
+    title: params.description + ` (@${next.name} subagent)`,
+```
+
+然后把 prompt 投递给子代理：
+
+```ts
+const result = yield* ops.prompt({
+  messageID,
+  sessionID: nextSession.id,
+  model: {
+    modelID: model.modelID,
+    providerID: model.providerID,
+  },
+  agent: next.name,
+  tools: {
+    ...(canTodo ? {} : { todowrite: false }),
+    ...(canTask ? {} : { task: false }),
+  },
+  parts,
+})
+```
+
+这就是 `opencode` 的一个关键“agentic”点：
+
+- 检索不是只能靠主 agent。
+- 广义探索可以被降级成一个专门的 explore/planner 子代理任务。
+- 子代理的结果再作为工具输出回到主会话。
+
+这个设计比“一个模型包打天下”稳得多，因为开放式搜索天然容易污染主上下文。
+
+---
+
+## 真实实现 5：工具结果不是临时字符串，而是会写入消息历史并参加下一轮推理
+
+这一步是 `opencode` 的核心。很多所谓的 agent 框架只是在内存里拿到工具结果，然后临时拼接一个 prompt 再问模型。`opencode` 不是这样，它会把工具结果持久化成 `part`，再由 `MessageV2.toModelMessagesEffect()` 统一编码。
+
+### 工具执行时先写入 `tool part`
+
+在 `packages/opencode/src/session/processor.ts`：
+
+```ts
+const part = yield* session.updatePart({
+  id: ctx.toolcalls[value.id]?.partID ?? PartID.ascending(),
+  messageID: ctx.assistantMessage.id,
+  sessionID: ctx.assistantMessage.sessionID,
+  type: "tool",
+  tool: value.toolName,
+  callID: value.id,
+  state: { status: "pending", input: {}, raw: "" },
+} satisfies MessageV2.ToolPart)
+```
+
+真正调用后切到 `running`：
+
+```ts
+yield* updateToolCall(value.toolCallId, (match) => ({
+  ...match,
+  tool: value.toolName,
+  state: {
+    ...match.state,
+    status: "running",
+    input: value.input,
+    time: { start: Date.now() },
+  },
+}))
+```
+
+完成后写回结果：
+
+```ts
+yield* session.updatePart({
+  ...match.part,
+  state: {
+    status: "completed",
+    input: match.part.state.input,
+    output: output.output,
+    metadata: output.metadata,
+    title: output.title,
+    time: { start: match.part.state.time.start, end: Date.now() },
+    attachments: output.attachments,
+  },
+})
+```
+
+### 下一轮把这些结果重新编码给模型
+
+在 `packages/opencode/src/session/message-v2.ts`：
+
+```ts
+if (part.type === "tool") {
+  toolNames.add(part.tool)
+  if (part.state.status === "completed") {
+    const outputText = part.state.time.compacted
+      ? "[Old tool result content cleared]"
+      : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+
+    assistantMessage.parts.push({
+      type: ("tool-" + part.tool) as `tool-${string}`,
+      state: "output-available",
+      toolCallId: part.callID,
+      input: part.state.input,
+      output,
+    })
+  }
+}
+```
+
+最后统一转换成模型 SDK 要的消息格式：
+
+```ts
+return yield* Effect.promise(() =>
+  convertToModelMessages(
+    result.filter((msg) => msg.parts.some((part) => part.type !== "step-start")),
+    {
+      tools,
+    },
+  ),
+)
+```
+
+这意味着：
+
+- 工具结果不是一次性字符串。
+- 它有状态机：`pending -> running -> completed/error`。
+- 它是历史消息的一部分。
+- 下一轮模型看到的是完整的 `tool-call -> tool-result` 对。
+
+这正是 Agentic RAG 的关键：**retrieval 是会话状态的一部分，而不是 prompt 拼接小技巧。**
+
+---
+
+## 真实实现 6：主循环怎样把检索串起来
+
+主循环在 `packages/opencode/src/session/prompt.ts`。
+
+先解析本轮可用工具：
+
+```ts
+const tools = yield* resolveTools({
+  agent,
+  session,
+  model,
+  tools: lastUser.tools,
+  processor: handle,
+  bypassAgentCheck,
+  messages: msgs,
+})
+```
+
+再同时准备四类上下文：
+
+```ts
+const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+  sys.skills(agent),
+  Effect.sync(() => sys.environment(model)),
+  instruction.system().pipe(Effect.orDie),
+  MessageV2.toModelMessagesEffect(msgs, model),
+])
+const system = [...env, ...(skills ? [skills] : []), ...instructions]
+```
+
+然后真正发给模型：
+
+```ts
+const result = yield* handle.process({
+  user: lastUser,
+  agent,
+  permission: session.permission,
+  sessionID,
+  parentSessionID: session.parentID,
+  system,
+  messages: [...modelMsgs, ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS }] : [])],
+  tools,
+  model,
+})
+```
+
+这三步非常重要：
+
+1. `system`
+   - 环境信息
+   - skills
+   - AGENTS/CLAUDE 等系统指令
+
+2. `messages`
+   - 用户历史
+   - assistant 历史
+   - 已完成的工具调用结果
+
+3. `tools`
+   - 当前 agent 有权调用的检索/编辑/执行工具
+
+模型不是一次性拿到“所有知识”，而是在每一轮里根据已有上下文再决定是否继续检索。这就是它的 agentic 部分。
+
+---
+
+## 一个 opencode 仓库内的具体例子
+
+下面不用外部案例，直接用这个仓库里一个真实会发生的问题：
+
+> 用户问：`TaskTool` 是怎么靠 `task_id` 恢复子任务会话的？
+
+### 第 1 轮：先做粗召回
+
+模型很可能先发：
+
+```text
+grep(pattern="task_id", path="packages/opencode/src")
+```
+
+或：
+
+```text
+glob(pattern="**/task.ts", path="packages/opencode/src")
+```
+
+`grep` 命中后会返回类似：
+
+```text
+Found 3 matches
+/Users/dongxg/SourceCode/opencode/packages/opencode/src/tool/task.ts:
+  Line 24:   task_id: z
+  Line 63:   const taskID = params.task_id
+```
+
+这一步的作用不是让模型直接回答，而是把候选位置缩到 `task.ts`。
+
+### 第 2 轮：精读关键文件
+
+接着模型再发：
+
+```text
+read(filePath="/Users/dongxg/SourceCode/opencode/packages/opencode/src/tool/task.ts")
+```
+
+如果它还要看子任务是怎么被上层驱动的，就会继续读：
+
+```text
+read(filePath="/Users/dongxg/SourceCode/opencode/packages/opencode/src/session/prompt.ts", offset=420, limit=260)
+```
+
+这样它拿到两段核心信息：
+
+1. `task.ts` 里：
+
+```ts
+const taskID = params.task_id
+const session = taskID
+  ? yield* sessions.get(SessionID.make(taskID)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+  : undefined
+```
+
+2. 同一个文件里：
+
+```ts
+const nextSession =
+  session ??
+  (yield* sessions.create({
+    parentID: ctx.sessionID,
+    title: params.description + ` (@${next.name} subagent)`,
+```
+
+这两段组合起来，模型就能得出明确结论：
+
+- 有 `task_id` 时优先恢复旧子 session。
+- 没有时才新建。
+
+### 第 3 轮：如果范围还不清楚，就升级成子代理检索
+
+如果用户问的是更大的问题：
+
+> `TaskTool`、`SessionPrompt`、`MessageV2`、`Processor` 四者如何配合？
+
+那主模型可以直接发：
+
+```text
+task(
+  description="trace task flow",
+  prompt="Trace how TaskTool creates or resumes subtask sessions and how results return to parent context",
+  subagent_type="explore"
+)
+```
+
+这时 `opencode` 并不会让主会话直接塞进更多原始代码，而是：
+
+1. 新建/恢复一个 explore 子 session。
+2. 在子 session 里做多步检索。
+3. 把最终摘要作为 `task` 工具输出写回主会话。
+
+这就是“检索也能层级化”的 agentic RAG。
+
+### 第 4 轮：结果回灌后再回答
+
+一旦 `grep` / `read` / `task` 的结果都变成历史消息，`MessageV2.toModelMessagesEffect()` 会把它们编码成下一轮可见的工具结果。模型这时已经拥有：
+
+- `task.ts` 的命中位置
+- 关键实现片段
+- 上层 `prompt.ts` 的调度信息
+- 可能还有子代理给出的摘要
+
+这时它才输出最终解释。
+
+---
+
+## 用 Mermaid 画出这个具体例子
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant P as SessionPrompt.loop
+  participant L as LLM
+  participant G as grep/glob
+  participant R as read
+  participant T as task subagent
+  participant M as MessageV2.toModelMessagesEffect
+
+  U->>P: "TaskTool 是怎么靠 task_id 恢复子任务会话的？"
+  P->>L: system + history + tools
+  L-->>P: grep(task_id)
+  P->>G: rg search
+  G-->>P: task.ts 命中行号
+  P->>M: 写入 tool result
+  M->>L: 下一轮带上 grep 结果
+  L-->>P: read(task.ts)
+  P->>R: 读取 task.ts
+  R-->>P: 恢复 session / 创建 session 代码
+  P->>M: 写入 tool result
+  M->>L: 下一轮带上 read 结果
+  alt 问题仍然太宽
+    L-->>P: task(subagent_type=explore)
+    P->>T: 启动 explore 子代理
+    T-->>P: 汇总任务流
+    P->>M: 写入 task result
+    M->>L: 下一轮带上子代理摘要
+  end
+  L-->>P: 最终解释
+  P-->>U: 回答
+```
+
+---
+
+## 为什么说它是 Agentic RAG，而不是普通 Tool Use
+
+普通 Tool Use 只满足一件事：模型能调工具。
+
+`opencode` 的实现更进一步：
+
+1. **检索是分层的**
+   - `instruction.system()` 检索项目规则
+   - `glob` / `grep` 做粗召回
+   - `read` 做精读
+   - `task` 做子代理级探索
+
+2. **检索结果进入正式历史**
+   - 不是拼 prompt 字符串
+   - 是落到 `ToolPart` 状态机里
+
+3. **检索是多轮自适应的**
+   - 模型先搜，再根据结果决定下一搜什么
+
+4. **检索可以跨 agent**
+   - 主 agent 不适合做开放式搜索时，可以让 explore 子代理接手
+
+5. **检索受权限和上下文预算约束**
+   - 每个工具都走 `ctx.ask`
+   - 超长结果会 truncation
+   - 超长上下文会 compaction
+
+所以准确说，`opencode` 的 Agentic RAG 是：
+
+> 一个以工具为检索器、以会话历史为中间存储、以多轮推理为控制器、以权限和压缩机制为护栏的运行时检索增强系统。
+
+---
+
+## 和经典向量 RAG 的差别
+
+| 维度 | 经典向量 RAG | opencode 的 Agentic RAG |
+| --- | --- | --- |
+| 索引对象 | 文档 chunk | 文件树、源码、目录规则、子代理摘要 |
+| 召回方式 | embedding similarity | `glob` / `grep` / `read` / `task` |
+| 检索时机 | 通常在首轮前 | 每一轮都可能触发 |
+| 控制器 | 预定义 pipeline | 模型自主决定下一步检索 |
+| 中间状态 | 临时 prompt 拼接 | 正式消息历史 + tool part |
+| 长上下文策略 | top-k / rerank | truncation + compaction + 续读 |
+
+这张表背后的含义很重要：
+
+- `opencode` 优先优化“代码仓库里的精确定位”。
+- 它不试图用 embedding 替代代码理解。
+- 它相信检索本身也应该是 agent 行为，而不是前置黑盒。
+
+---
+
+## 如果你要自己复刻 opencode 这一套，最不能省的代码
+
+如果要复刻这套机制，下面四段代码最不能少：
+
+1. **工具动态装配**
+   文件：`packages/opencode/src/session/prompt.ts`
+
+```ts
+const tools = yield* resolveTools({
+  agent,
+  session,
+  model,
+  tools: lastUser.tools,
+  processor: handle,
+  bypassAgentCheck,
+  messages: msgs,
+})
+```
+
+2. **检索工具底层**
+   文件：`packages/opencode/src/tool/grep.ts`
+
+```ts
+const result = yield* rg.search({
+  cwd,
+  pattern: params.pattern,
+  glob: params.include ? [params.include] : undefined,
+  file,
+  signal: ctx.abort,
+})
+```
+
+3. **工具结果回灌到历史**
+   文件：`packages/opencode/src/session/processor.ts`
+
+```ts
+yield* session.updatePart({
+  ...match.part,
+  state: {
+    status: "completed",
+    input: match.part.state.input,
+    output: output.output,
+    metadata: output.metadata,
+    title: output.title,
+    time: { start: match.part.state.time.start, end: Date.now() },
+    attachments: output.attachments,
+  },
+})
+```
+
+4. **历史转下一轮模型输入**
+   文件：`packages/opencode/src/session/message-v2.ts`
+
+```ts
+assistantMessage.parts.push({
+  type: ("tool-" + part.tool) as `tool-${string}`,
+  state: "output-available",
+  toolCallId: part.callID,
+  input: part.state.input,
+  output,
+})
+```
+
+少掉任何一段，系统都退化：
+
+- 没有 1：模型看不到工具。
+- 没有 2：没有高质量召回。
+- 没有 3：检索结果不能沉淀。
+- 没有 4：下一轮推理吃不到前一轮检索成果。
+
+---
+
+## 最后一句话总结
+
+`opencode` 里的 Agentic RAG，本质上是 **“模型驱动的代码检索工作流”**：
+
+- 用 `AGENTS.md` / `CLAUDE.md` 做规则召回，
+- 用 `glob` / `grep` 做候选召回，
+- 用 `read` 做源码精读，
+- 用 `task` 做子代理级探索，
+- 用 `MessageV2.toModelMessagesEffect()` 把检索结果回灌给下一轮模型，
+- 用 `compaction` 解决长上下文问题。
+
+它不是一个抽象概念，而是一条在 `prompt.ts`、`processor.ts`、`message-v2.ts`、`instruction.ts`、`tool/*.ts` 里真正跑起来的闭环。
