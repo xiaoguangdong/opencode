@@ -1,3 +1,37 @@
+/**
+ * SessionPrompt — 会话提示词主循环模块
+ *
+ * 这是 OpenCode 最核心的模块，负责编排从用户输入到模型回复的完整对话流程。
+ *
+ * 核心职责：
+ *  1. prompt() — 用户消息入口：创建用户消息、解析附件、触发对话循环
+ *  2. runLoop() — 对话主循环：反复调用 LLM 直到对话结束或达到最大步数
+ *  3. resolveTools() — 工具解析：收集内置工具 + MCP 工具，注入权限检查
+ *  4. createUserMessage() — 用户消息构建：解析文件/agent/text/subtask 各类 part
+ *  5. handleSubtask() — 子任务处理：通过 task 工具调用子代理执行任务
+ *  6. shellImpl() — Shell 命令执行：用户直接执行 shell 命令
+ *  7. command() — 斜杠命令执行：模板展开 + 参数替换后转为 prompt
+ *  8. insertReminders() — 上下文提醒注入：plan 模式提示、build 切换提示
+ *  9. title() — 自动标题生成：用小模型为会话生成简短标题
+ * 10. resolvePromptParts() — 模板文件解析：解析 @file 引用并转为消息 part
+ *
+ * 对话循环 (runLoop) 每轮执行：
+ *   1. 加载历史消息 → 找到 lastUser / lastAssistant / lastFinished
+ *   2. 判断是否应该退出循环（模型已完成且无工具调用）
+ *   3. 处理待执行的 subtask / compaction
+ *   4. 检查上下文溢出 → 触发自动压缩
+ *   5. 解析工具集（内置 + MCP）
+ *   6. 构建 system prompt（环境 + skills + instructions）
+ *   7. 调用 SessionProcessor → LLM 流式推理 + 工具执行
+ *   8. 根据结果决定 break / continue
+ *
+ * 依赖注入：通过 Effect Layer 注入 25+ 个 Service，包括：
+ *   Bus, SessionStatus, Session, Agent, Provider, SessionProcessor,
+ *   SessionCompaction, Plugin, Command, Permission, AppFileSystem,
+ *   MCP, LSP, ToolRegistry, Truncate, ChildProcessSpawner, Scope,
+ *   Instruction, SessionRunState, SessionRevert, SessionSummary,
+ *   SystemPrompt, LLM, EffectBridge
+ */
 import path from "path"
 import os from "os"
 import z from "zod"
@@ -54,6 +88,7 @@ import { Trace } from "@/util"
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
+/** 结构化输出工具的描述文本，指导模型在最终回复时调用此工具 */
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -64,10 +99,12 @@ IMPORTANT:
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
+// ── 日志与追踪实例 ──
 const log = Log.create({ service: "session.prompt" })
 const elog = EffectLogger.create({ service: "session.prompt" })
 const trace = Trace.create("session", "packages/opencode/src/session/prompt.ts")
 
+/** 用于日志摘要化 parts 列表（避免打印完整文件内容） */
 function summarizeParts(parts: Array<{ type: string; text?: string; filename?: string; mime?: string; name?: string }>) {
   return parts.map((part) => {
     if (part.type === "text") return { type: part.type, text: part.text }
@@ -77,6 +114,15 @@ function summarizeParts(parts: Array<{ type: string; text?: string; filename?: s
   })
 }
 
+/**
+ * SessionPrompt 服务接口定义
+ * - cancel: 取消正在进行的会话循环
+ * - prompt: 处理用户输入并触发对话循环
+ * - loop: 手动触发对话循环（不创建新用户消息）
+ * - shell: 用户直接执行 shell 命令
+ * - command: 执行斜杠命令（/command）
+ * - resolvePromptParts: 将模板字符串解析为消息 part 列表
+ */
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
@@ -86,8 +132,16 @@ export interface Interface {
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
+/** Effect Context Service 标签，用于依赖注入 */
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
 
+/**
+ * SessionPrompt 的 Effect Layer 工厂
+ *
+ * 通过 Layer.effect 构建，内部注入 25+ 个依赖 Service，
+ * 定义所有核心函数（prompt, runLoop, resolveTools, shellImpl, command 等），
+ * 最终返回 Service.of({ cancel, prompt, loop, shell, command, resolvePromptParts })
+ */
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -126,11 +180,20 @@ export const layer = Layer.effect(
       } satisfies TaskPromptOps
     })
 
+    /** 取消正在进行的会话循环 */
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* elog.info("cancel", { sessionID })
       yield* state.cancel(sessionID)
     })
 
+    /**
+     * 解析模板字符串中的 @file 引用，将其转为消息 part 列表
+     *
+     * 支持：
+     *  - @filepath → 文件 part（读取为 text/plain 或 directory）
+     *  - @agent-name → agent part（从已注册 agent 列表中查找）
+     *  - 纯文本 → text part
+     */
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
       const ctx = yield* InstanceState.context
       const parts: PromptInput["parts"] = [{ type: "text", text: template }]
@@ -165,6 +228,18 @@ export const layer = Layer.effect(
       return parts
     })
 
+    /**
+     * 自动生成会话标题
+     *
+     * 在会话的第一条用户消息后，使用小模型生成一个简短标题。
+     * 条件：非子会话、标题为默认值、只有一条真实用户消息。
+     *
+     * 流程：
+     *  1. 找到第一条真实用户消息（非纯 synthetic）
+     *  2. 用 title agent（小模型）生成标题文本
+     *  3. 清洗标题（去除 think 标签、取第一行、截断到 100 字符）
+     *  4. 更新会话标题
+     */
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
       session: Session.Info
       history: MessageV2.WithParts[]
@@ -227,6 +302,25 @@ export const layer = Layer.effect(
         .pipe(Effect.catchCause((cause) => elog.error("failed to generate title", { error: Cause.squash(cause) })))
     })
 
+    /**
+     * 注入上下文提醒 — 根据当前 agent 模式注入系统提示
+     *
+     * 两种模式：
+     *  1. 非实验性 plan 模式（默认）：
+     *     - plan agent → 注入 PROMPT_PLAN 提示
+     *     - 从 plan 切换到 build → 注入 BUILD_SWITCH 提示
+     *
+     *  2. 实验性 plan 模式（Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE）：
+     *     - plan agent 时：注入完整的 plan 工作流提示（5 个阶段）
+     *     - 非 plan agent 但上一条是 plan → 注入 BUILD_SWITCH + 执行计划文件提示
+     *
+     * plan 工作流包含 5 个阶段：
+     *  Phase 1: Initial Understanding（用 explore 子代理探索代码库）
+     *  Phase 2: Design（用 general 子代理设计方案）
+     *  Phase 3: Review（审查方案，确保对齐用户意图）
+     *  Phase 4: Final Plan（将最终计划写入 plan 文件）
+     *  Phase 5: Call plan_exit（结束规划）
+     */
     const insertReminders = Effect.fn("SessionPrompt.insertReminders")(function* (input: {
       messages: MessageV2.WithParts[]
       agent: Agent.Info
@@ -362,6 +456,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return input.messages
     })
 
+    /**
+     * 解析本轮可用工具集 — 收集内置工具 + MCP 工具，包装为 AI SDK Tool 格式
+     *
+     * 为每个工具：
+     *  1. 通过 ProviderTransform.schema 转换参数 schema（provider 兼容性）
+     *  2. 注入 execute 包装器：
+     *     - 构建 Tool.Context（sessionID, abort, messageID, callID, messages, metadata, ask）
+     *     - 触发 plugin 钩子（tool.execute.before / after）
+     *     - 通过 EffectBridge 将 Effect 执行转为 Promise（AI SDK 要求）
+     *  3. MCP 工具额外处理：
+     *     - 权限检查（ctx.ask）
+     *     - 将 MCP 返回的 content 转为 OpenCode 的 output + attachments 格式
+     *     - 输出截断（truncate.output）
+     *
+     * @param input.agent - 当前 agent 配置
+     * @param input.model - 当前模型（用于 schema 转换）
+     * @param input.tools - 用户指定的工具覆盖（enabled/disabled）
+     * @param input.bypassAgentCheck - 是否绕过 agent 检查（用于 task 工具内部调用）
+     */
     const resolveTools = Effect.fn("SessionPrompt.resolveTools")(function* (input: {
       agent: Agent.Info
       model: Provider.Model
@@ -613,6 +726,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return tools
     })
 
+    /**
+     * 处理子任务（subtask） — 通过 task 工具调用子代理执行
+     *
+     * 子任务来源：用户消息中的 subtask part（通过 /command 斜杠命令触发）
+     *
+     * 流程：
+     *  1. 创建 assistant 消息 + tool part（标记为 running）
+     *  2. 获取 task agent 配置（不存在则报错）
+     *  3. 调用 TaskTool.execute() — 这会触发子代理的完整对话循环
+     *  4. 更新 tool part 为 completed/error 状态
+     *  5. 如果是 command subtask，插入一条 "Summarize the task tool output" 提示
+     *     让主 agent 继续处理
+     *
+     * 中断处理：如果任务被取消，abort taskAbort，标记 part 为 error 状态
+     */
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
       task: MessageV2.SubtaskPart
       model: Provider.Model
@@ -806,6 +934,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       } satisfies MessageV2.TextPart)
     })
 
+    /**
+     * Shell 命令执行实现 — 用户直接通过 CLI 执行 shell 命令
+     *
+     * 流程：
+     *  1. 创建 user message + assistant message + tool part（tool: "bash"）
+     *  2. 根据当前系统 shell（zsh/bash/fish/nu/powershell/cmd）构造调用参数
+     *  3. 通过 plugin 触发 shell.env 钩子（允许插件注入环境变量）
+     *  4. 使用 Effect ChildProcess.spawn 执行命令
+     *  5. 实时流式收集 stdout+stderr 到 output
+     *  6. 完成后更新 tool part 为 completed 状态
+     *
+     * 中断处理：标记 aborted，在 finish 中追加 "User aborted" 消息
+     *
+     * @param input.command - 要执行的 shell 命令字符串
+     */
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput) {
       const ctx = yield* InstanceState.context
       const run = yield* runner()
@@ -983,6 +1126,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info: msg, parts: [part] }
     })
 
+    /**
+     * 获取模型实例 — 带 "Did you mean" 提示的错误处理
+     *
+     * 如果模型不存在，从 Provider 的建议列表中生成提示，
+     * 通过 Bus 发布错误事件，然后 fail
+     */
     const getModel = Effect.fn("SessionPrompt.getModel")(function* (
       providerID: ProviderID,
       modelID: ModelID,
@@ -1003,12 +1152,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return yield* Effect.failCause(exit.cause)
     })
 
+    /** 获取会话中最后一次使用的模型（从最近一条有 model 的 user 消息中提取），不存在则返回默认模型 */
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel()
     })
 
+    /**
+     * 创建用户消息 — 解析 PromptInput 中的各类型 part 并写入存储
+     *
+     * 处理的 part 类型：
+     *  1. text part → 直接转为 MessageV2.TextPart
+     *  2. file part:
+     *     - MCP resource source → 调用 mcp.readResource() 获取内容
+     *     - data: URL → 解码 base64 内容
+     *     - file: URL → 调用 read 工具读取文件内容
+     *       - text/plain → 读取后转为 text part
+     *       - application/x-directory → 调用 read 工具列出目录
+     *       - 其他 → 读取为 base64 file part
+     *  3. agent part → 转为 agent part + 提示文本（"调用 task 工具"）
+     *
+     * 完成后：
+     *  - 触发 plugin "chat.message" 钩子
+     *  - Zod 验证消息和 part 的合法性
+     *  - 写入 sessions 存储
+     */
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent || (yield* agents.defaultAgent())
       const ag = yield* agents.get(agentName)
@@ -1398,6 +1567,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
+    /**
+     * prompt() — 用户消息入口（对外核心接口）
+     *
+     * 完整流程：
+     *  1. 获取会话信息，清理 revert 状态
+     *  2. 调用 createUserMessage() 创建用户消息并写入存储
+     *  3. 根据 input.tools 设置会话权限（allow/deny per-tool）
+     *  4. 如果 noReply=true，仅存储消息不触发模型回复
+     *  5. 否则调用 loop() 进入对话主循环
+     *
+     * @param input - PromptInput（sessionID, parts, agent, model, variant, tools, format, system, noReply）
+     * @returns 最后一条 assistant 消息（含 parts）
+     */
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         trace.info("收到新的用户 prompt 请求", {
@@ -1448,6 +1630,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       },
     )
 
+    /** 获取会话中最后一条非 user 消息（assistant/tool），不存在则取最后一条消息 */
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
       if (Option.isSome(match)) return match.value
@@ -1456,6 +1639,41 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       throw new Error("Impossible")
     })
 
+    /**
+     * runLoop() — 对话主循环（核心引擎）
+     *
+     * 这是 OpenCode 最核心的函数，实现了 Agent 的工具调用循环。
+     *
+     * 循环每轮执行：
+     *  1. 加载历史消息（过滤已压缩的）
+     *  2. 从末尾向前扫描，找到 lastUser / lastAssistant / lastFinished + 待处理 tasks
+     *  3. 退出条件判断：
+     *     - lastAssistant 已完成（finish 非 tool-calls/unknown）
+     *     - 无工具调用
+     *     - user 在 assistant 之前 → break
+     *  4. step=1 时异步生成标题
+     *  5. 解析模型实例
+     *  6. 处理待执行的 subtask（调用 handleSubtask）或 compaction
+     *  7. 检查上下文溢出 → 自动触发 compaction.create()
+     *  8. 解析 agent 配置，检查 maxSteps 限制
+     *  9. 注入上下文提醒（insertReminders）
+     *  10. 创建 assistant 消息 + processor handle
+     *  11. 解析工具集（resolveTools）
+     *  12. 如果用户请求结构化输出，注入 StructuredOutput 工具
+     *  13. 将 step>1 期间新增的 user 消息包装为 system-reminder
+     *  14. 构建 system prompt（环境 + skills + instructions）
+     *  15. 调用 handle.process() → LLM 流式推理 + 工具执行
+     *  16. 根据结果决定 break / continue
+     *     - 结构化输出成功 → break
+     *     - finish 且无 error → break（或 json_schema 失败 → 设置 error）
+     *     - result="stop" → break
+     *     - result="compact" → 触发压缩
+     *     - 其他 → continue
+     *
+     * 循环结束后：
+     *  - 异步执行 compaction.prune（清理过期压缩）
+     *  - 返回最后一条 assistant 消息
+     */
     const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
@@ -1787,18 +2005,43 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       },
     )
 
+    /**
+     * loop() — 对外暴露的循环入口
+     *
+     * 通过 state.ensureRunning() 确保同一会话不会并发运行多个循环。
+     * 如果已有循环在运行，返回当前循环的最终 assistant 消息。
+     * 否则启动新的 runLoop。
+     */
     const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
       "SessionPrompt.loop",
     )(function* (input: z.infer<typeof LoopInput>) {
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    /** shell() — 对外暴露的 shell 执行入口，通过 state.startShell 确保并发安全 */
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
       function* (input: ShellInput) {
         return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input))
       },
     )
 
+    /**
+     * command() — 斜杠命令执行（/command [args]）
+     *
+     * 流程：
+     *  1. 从 Command.Service 获取命令模板
+     *  2. 参数替换：
+     *     - $1, $2... → 按位置参数替换（最后一个 $N 获取剩余所有参数）
+     *     - $ARGUMENTS → 替换为完整参数字符串
+     *  3. Shell 命令展开：模板中的 `!`command`` → 执行并替换输出
+     *  4. 解析模型（cmd.model → cmd.agent.model → input.model → lastModel）
+     *  5. 如果是 subagent 且非禁止 subtask，创建 subtask part
+     *  6. 调用 prompt() 执行
+     *  7. 发布 Command.Event.Executed 事件
+     *
+     * @param input.command - 命令名称
+     * @param input.arguments - 命令参数字符串
+     */
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
       const cmd = yield* commands.get(input.command)
@@ -1926,6 +2169,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   }),
 )
 
+/**
+ * defaultLayer — SessionPrompt 的默认 Effect Layer
+ *
+ * 将 SessionPrompt 的 layer 与所有依赖 Service 的 defaultLayer 组合，
+ * 形成一个可独立运行的完整依赖树。
+ *
+ * 依赖的 Service（按提供顺序）：
+ *  SessionRunState → SessionStatus → SessionCompaction → SessionProcessor →
+ *  Command → Permission → MCP → LSP → ToolRegistry → Truncate → Provider →
+ *  Instruction → AppFileSystem → Plugin → Session → SessionRevert → SessionSummary →
+ *  Agent + SystemPrompt + LLM + Bus + CrossSpawnSpawner
+ */
 export const defaultLayer = Layer.suspend(() =>
   layer.pipe(
     Layer.provide(SessionRunState.defaultLayer),
@@ -1956,6 +2211,21 @@ export const defaultLayer = Layer.suspend(() =>
     ),
   ),
 )
+/**
+ * PromptInput — 用户输入的 Zod Schema
+ *
+ * 用户通过 CLI/TUI/API 发送的消息结构：
+ *  - sessionID: 会话 ID
+ *  - messageID: 可选，指定消息 ID
+ *  - model: 可选，指定使用的模型 { providerID, modelID }
+ *  - agent: 可选，指定使用的 agent
+ *  - noReply: 可选，仅存储消息不触发模型回复
+ *  - tools: @deprecated，工具权限覆盖
+ *  - format: 可选，输出格式（text 或 json_schema）
+ *  - system: 可选，额外系统提示
+ *  - variant: 可选，推理变体（如 low/medium/high）
+ *  - parts: 消息内容数组（text/file/agent/subtask）
+ */
 export const PromptInput = z.object({
   sessionID: SessionID.zod,
   messageID: MessageID.zod.optional(),
@@ -1996,10 +2266,12 @@ export type PromptInput = Omit<z.infer<typeof PromptInput>, "parts"> & {
   parts: PartInputUnion[]
 }
 
+/** LoopInput — 手动触发对话循环的输入（仅需 sessionID） */
 export const LoopInput = z.object({
   sessionID: SessionID.zod,
 })
 
+/** ShellInput — 用户直接执行 shell 命令的输入 */
 export const ShellInput = z.object({
   sessionID: SessionID.zod,
   messageID: MessageID.zod.optional(),
@@ -2014,6 +2286,7 @@ export const ShellInput = z.object({
 })
 export type ShellInput = z.infer<typeof ShellInput>
 
+/** CommandInput — 斜杠命令执行的输入 */
 export const CommandInput = z.object({
   messageID: MessageID.zod.optional(),
   sessionID: SessionID.zod,
@@ -2042,6 +2315,21 @@ export const CommandInput = z.object({
 })
 export type CommandInput = z.infer<typeof CommandInput>
 
+/**
+ * 创建结构化输出工具
+ *
+ * 当用户请求 json_schema 格式输出时，注入此工具。
+ * 模型必须调用此工具来返回结构化数据。
+ *
+ * 工作原理：
+ *  - 工具的 inputSchema 就是用户定义的 JSON Schema
+ *  - AI SDK 会自动验证模型输出是否符合 schema
+ *  - execute() 收到验证通过的参数后，通过 onSuccess 回调传给外层
+ *  - toModelOutput() 将工具结果转为简短文本返回给模型
+ *
+ * @param input.schema - 用户期望的 JSON Schema
+ * @param input.onSuccess - 成功回调，接收结构化输出
+ */
 /** @internal Exported for testing */
 export function createStructuredOutputTool(input: {
   schema: Record<string, any>
@@ -2070,10 +2358,11 @@ export function createStructuredOutputTool(input: {
     },
   })
 }
-const bashRegex = /!`([^`]+)`/g
+// ── 斜杠命令模板中的正则表达式 ──
+const bashRegex = /!`([^`]+)`/g // 匹配 !`command` 格式的内联 shell 命令
 // Match [Image N] as single token, quoted strings, or non-space sequences
-const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
-const placeholderRegex = /\$(\d+)/g
-const quoteTrimRegex = /^["']|["']$/g
+const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi // 命令参数分割（支持引号和 [Image N]）
+const placeholderRegex = /\$(\d+)/g // 匹配 $1, $2... 位置参数占位符
+const quoteTrimRegex = /^["']|["']$/g // 去除参数首尾引号
 
 export * as SessionPrompt from "./prompt"

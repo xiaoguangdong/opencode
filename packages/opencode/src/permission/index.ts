@@ -1,28 +1,53 @@
+// 引入事件总线服务
 import { Bus } from "@/bus"
+// 引入事件总线事件定义工具
 import { BusEvent } from "@/bus/bus-event"
+// 引入配置中的权限信息类型
 import { ConfigPermission } from "@/config/permission"
+// 引入基于 Instance 的状态管理
 import { InstanceState } from "@/effect"
+// 引入项目 ID schema
 import { ProjectID } from "@/project/schema"
+// 引入消息 ID / 会话 ID schema
 import { MessageID, SessionID } from "@/session/schema"
+// 引入权限持久化表
 import { PermissionTable } from "@/session/session.sql"
+// 引入数据库工具
 import { Database, eq } from "@/storage"
+// 引入 Schema <-> zod 桥接
 import { zod } from "@/util/effect-zod"
+// 引入日志与 Trace
 import { Log, Trace } from "@/util"
+// 引入给 Schema 附加静态属性的工具
 import { withStatics } from "@/util/schema"
+// 引入通配符匹配工具
 import { Wildcard } from "@/util"
+// 引入 Effect 核心类型
 import { Deferred, Effect, Layer, Schema, Context } from "effect"
 import os from "os"
+// 引入规则评估函数
 import { evaluate as evalRule } from "./evaluate"
+// 引入 PermissionID schema
 import { PermissionID } from "./schema"
 
+// 创建本模块 logger 与 Trace
 const log = Log.create({ service: "permission" })
 const trace = Trace.create("permission", "packages/opencode/src/permission/index.ts")
 
+/**
+ * 权限动作:allow / deny / ask
+ */
 export const Action = Schema.Literals(["allow", "deny", "ask"])
   .annotate({ identifier: "PermissionAction" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type Action = Schema.Schema.Type<typeof Action>
 
+/**
+ * 一条权限规则:
+ * - permission: 权限名(例如 read / edit / bash)
+ * - pattern:    匹配模式(可为通配符)
+ * - action:     allow / deny / ask
+ */
 export class Rule extends Schema.Class<Rule>("PermissionRule")({
   permission: Schema.String,
   pattern: Schema.String,
@@ -31,11 +56,21 @@ export class Rule extends Schema.Class<Rule>("PermissionRule")({
   static readonly zod = zod(this)
 }
 
+// 规则集:Rule 的数组
 export const Ruleset = Schema.mutable(Schema.Array(Rule))
   .annotate({ identifier: "PermissionRuleset" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type Ruleset = Schema.Schema.Type<typeof Ruleset>
 
+/**
+ * 一次权限请求
+ * - id / sessionID:     请求 ID 与会话 ID
+ * - permission:         权限名
+ * - patterns:           待检查的模式列表
+ * - metadata:           附加元数据
+ * - always:             "always" 允许后要固化的模式列表
+ * - tool:               关联的工具调用信息(可选)
+ */
 export class Request extends Schema.Class<Request>("PermissionRequest")({
   id: PermissionID,
   sessionID: SessionID,
@@ -53,19 +88,25 @@ export class Request extends Schema.Class<Request>("PermissionRequest")({
   static readonly zod = zod(this)
 }
 
+// 用户回复:一次允许 / 始终允许 / 拒绝
 export const Reply = Schema.Literals(["once", "always", "reject"]).pipe(withStatics((s) => ({ zod: zod(s) })))
 export type Reply = Schema.Schema.Type<typeof Reply>
 
+// 回复结构公共字段(回复类型 + 可选反馈消息)
 const reply = {
   reply: Reply,
   message: Schema.optional(Schema.String),
 }
 
+// 回复请求体 schema
 export const ReplyBody = Schema.Struct(reply)
   .annotate({ identifier: "PermissionReplyBody" })
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ReplyBody = Schema.Schema.Type<typeof ReplyBody>
 
+/**
+ * 已批准的规则(持久化到项目级)
+ */
 export class Approval extends Schema.Class<Approval>("PermissionApproval")({
   projectID: ProjectID,
   patterns: Schema.Array(Schema.String),
@@ -73,6 +114,11 @@ export class Approval extends Schema.Class<Approval>("PermissionApproval")({
   static readonly zod = zod(this)
 }
 
+/**
+ * 权限相关总线事件
+ * - Asked:   请求权限
+ * - Replied: 用户回复
+ */
 export const Event = {
   Asked: BusEvent.define("permission.asked", Request.zod),
   Replied: BusEvent.define(
@@ -87,12 +133,14 @@ export const Event = {
   ),
 }
 
+// 用户直接拒绝
 export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("PermissionRejectedError", {}) {
   override get message() {
     return "The user rejected permission to use this specific tool call."
   }
 }
 
+// 用户带反馈拒绝
 export class CorrectedError extends Schema.TaggedErrorClass<CorrectedError>()("PermissionCorrectedError", {
   feedback: Schema.String,
 }) {
@@ -101,6 +149,7 @@ export class CorrectedError extends Schema.TaggedErrorClass<CorrectedError>()("P
   }
 }
 
+// 规则命中 deny
 export class DeniedError extends Schema.TaggedErrorClass<DeniedError>()("PermissionDeniedError", {
   ruleset: Schema.Any,
 }) {
@@ -109,8 +158,12 @@ export class DeniedError extends Schema.TaggedErrorClass<DeniedError>()("Permiss
   }
 }
 
+// 权限错误的联合类型
 export type Error = DeniedError | RejectedError | CorrectedError
 
+/**
+ * 请求权限的输入(规则集 + 请求体,id 可省略)
+ */
 export const AskInput = Schema.Struct({
   ...Request.fields,
   id: Schema.optional(PermissionID),
@@ -120,6 +173,9 @@ export const AskInput = Schema.Struct({
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type AskInput = Schema.Schema.Type<typeof AskInput>
 
+/**
+ * 回复权限请求的输入
+ */
 export const ReplyInput = Schema.Struct({
   requestID: PermissionID,
   ...reply,
@@ -128,22 +184,34 @@ export const ReplyInput = Schema.Struct({
   .pipe(withStatics((s) => ({ zod: zod(s) })))
 export type ReplyInput = Schema.Schema.Type<typeof ReplyInput>
 
+/**
+ * Permission 服务接口
+ * - ask:   发起一次权限检查,必要时等待用户审批
+ * - reply: 用户对某次请求的回复
+ * - list:  列出当前挂起的请求
+ */
 export interface Interface {
   readonly ask: (input: AskInput) => Effect.Effect<void, Error>
   readonly reply: (input: ReplyInput) => Effect.Effect<void>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
+// 挂起请求的条目:请求信息 + 等待中的 Deferred
 interface PendingEntry {
   info: Request
   deferred: Deferred.Deferred<void, RejectedError | CorrectedError>
 }
 
+// 按 Instance 隔离的状态
 interface State {
   pending: Map<PermissionID, PendingEntry>
   approved: Ruleset
 }
 
+/**
+ * 评估权限规则(对外导出,便于测试/复用)
+ * 会记录日志和 Trace。
+ */
 export function evaluate(permission: string, pattern: string, ...rulesets: Ruleset[]): Rule {
   log.info("evaluate", { permission, pattern, ruleset: rulesets.flat() })
   const result = evalRule(permission, pattern, ...rulesets)
@@ -156,14 +224,20 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Rules
   return result
 }
 
+// 定义 Effect Service Tag
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
+/**
+ * Permission 服务的 Layer 实现
+ */
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    // 按 Instance 隔离的状态
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
+        // 从数据库读取该项目已批准的规则集
         const row = Database.use((db) =>
           db.select().from(PermissionTable).where(eq(PermissionTable.project_id, ctx.project.id)).get(),
         )
@@ -172,6 +246,7 @@ export const layer = Layer.effect(
           approved: row?.data ?? [],
         }
 
+        // 销毁时把所有挂起请求置为拒绝,避免悬挂
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
@@ -185,6 +260,12 @@ export const layer = Layer.effect(
       }),
     )
 
+    /**
+     * 发起权限检查:
+     *  1. 对每个 pattern 求值,遇到 deny 立即抛 DeniedError
+     *  2. 全部 allow 则直接返回
+     *  3. 存在 ask 则创建挂起请求,广播 permission.asked 并等待用户回复
+     */
     const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
@@ -202,6 +283,7 @@ export const layer = Layer.effect(
       for (const pattern of request.patterns) {
         const rule = evaluate(request.permission, pattern, ruleset, approved)
         log.info("evaluated", { permission: request.permission, pattern, action: rule })
+        // 命中 deny 立即拒绝
         if (rule.action === "deny") {
           trace.warn("Permission 根据规则直接拒绝", {
             permission: request.permission,
@@ -212,10 +294,12 @@ export const layer = Layer.effect(
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
+        // 命中 allow 继续检查下一个
         if (rule.action === "allow") continue
         needsAsk = true
       }
 
+      // 无需询问则直接通过
       if (!needsAsk) {
         trace.info("Permission 根据规则直接允许", {
           permission: request.permission,
@@ -224,6 +308,7 @@ export const layer = Layer.effect(
         return
       }
 
+      // 生成请求 ID,构造请求信息
       const id = request.id ?? PermissionID.ascending()
       const info = Schema.decodeUnknownSync(Request)({
         id,
@@ -235,6 +320,7 @@ export const layer = Layer.effect(
         request: info,
       })
 
+      // 创建 Deferred 并登记到 pending,广播事件后等待回复
       const deferred = yield* Deferred.make<void, RejectedError | CorrectedError>()
       pending.set(id, { info, deferred })
       yield* bus.publish(Event.Asked, info)
@@ -246,6 +332,13 @@ export const layer = Layer.effect(
       )
     })
 
+    /**
+     * 处理用户回复:
+     *  - reject: 若带 message 则 CorrectedError,否则 RejectedError;
+     *            同时拒绝同会话所有其它挂起请求
+     *  - once:   仅本次允许
+     *  - always: 将 always 里的 patterns 固化到 approved,并放行同会话中已满足规则的挂起请求
+     */
     const reply = Effect.fn("Permission.reply")(function* (input: ReplyInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const existing = pending.get(input.requestID)
@@ -263,18 +356,21 @@ export const layer = Layer.effect(
         requestID: existing.info.id,
         reply: input.reply,
       })
+      // 广播 replied 事件
       yield* bus.publish(Event.Replied, {
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
         reply: input.reply,
       })
 
+      // 拒绝分支
       if (input.reply === "reject") {
         yield* Deferred.fail(
           existing.deferred,
           input.message ? new CorrectedError({ feedback: input.message }) : new RejectedError(),
         )
 
+        // 拒绝同会话所有其它挂起请求
         for (const [id, item] of pending.entries()) {
           if (item.info.sessionID !== existing.info.sessionID) continue
           pending.delete(id)
@@ -288,9 +384,12 @@ export const layer = Layer.effect(
         return
       }
 
+      // 放行当前请求
       yield* Deferred.succeed(existing.deferred, undefined)
+      // once 分支到此为止
       if (input.reply === "once") return
 
+      // always:把 always 中的 patterns 固化到 approved
       for (const pattern of existing.info.always) {
         approved.push({
           permission: existing.info.permission,
@@ -299,6 +398,7 @@ export const layer = Layer.effect(
         })
       }
 
+      // 尝试自动放行同会话中已被现有规则覆盖的挂起请求
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
         const ok = item.info.patterns.every(
@@ -315,6 +415,9 @@ export const layer = Layer.effect(
       }
     })
 
+    /**
+     * 列出所有挂起请求
+     */
     const list = Effect.fn("Permission.list")(function* () {
       const pending = (yield* InstanceState.get(state)).pending
       return Array.from(pending.values(), (item) => item.info)
@@ -324,6 +427,9 @@ export const layer = Layer.effect(
   }),
 )
 
+/**
+ * 展开路径中的 ~ / $HOME 占位符
+ */
 function expand(pattern: string): string {
   if (pattern.startsWith("~/")) return os.homedir() + pattern.slice(1)
   if (pattern === "~") return os.homedir()
@@ -332,12 +438,14 @@ function expand(pattern: string): string {
   return pattern
 }
 
+/**
+ * 从用户配置构造规则集:
+ *  - 把顶层 key 中的通配符(如 `*`、`mcp_*`)排到前面,具体规则排到后面。
+ *    与 evaluate 中的 findLast 配合,得到"具体规则覆盖 `*` 兜底"的语义,
+ *    不受用户 JSON 键顺序影响。
+ *  - 单个 permission key 内部的子 pattern 顺序保持原样,只对顶层 key 排序。
+ */
 export function fromConfig(permission: ConfigPermission.Info) {
-  // Sort top-level keys so wildcard permissions (`*`, `mcp_*`) come before
-  // specific ones. Combined with `findLast` in evaluate(), this gives the
-  // intuitive semantic "specific tool rules override the `*` fallback"
-  // regardless of the user's JSON key order. Sub-pattern order inside a
-  // single permission key is preserved — only top-level keys are sorted.
   const entries = Object.entries(permission).sort(([a], [b]) => {
     const aWild = a.includes("*")
     const bWild = b.includes("*")
@@ -345,10 +453,12 @@ export function fromConfig(permission: ConfigPermission.Info) {
   })
   const ruleset: Ruleset = []
   for (const [key, value] of entries) {
+    // 值为字符串时:action 为该字符串,pattern 取 "*"
     if (typeof value === "string") {
       ruleset.push({ permission: key, action: value, pattern: "*" })
       continue
     }
+    // 值为对象时:展开为多条 (pattern -> action) 规则
     ruleset.push(
       ...Object.entries(value).map(([pattern, action]) => ({ permission: key, pattern: expand(pattern), action })),
     )
@@ -356,12 +466,22 @@ export function fromConfig(permission: ConfigPermission.Info) {
   return ruleset
 }
 
+/**
+ * 合并多个规则集(简单拼接)
+ */
 export function merge(...rulesets: Ruleset[]): Ruleset {
   return rulesets.flat()
 }
 
+// 编辑类工具统一归入 "edit" 权限
 const EDIT_TOOLS = ["edit", "write", "apply_patch"]
 
+/**
+ * 计算被禁用的工具集合:
+ *  - 编辑类工具映射到 "edit" 权限
+ *  - 使用 findLast 找最具体的匹配规则
+ *  - 命中 pattern="*" 且 action="deny" 时视为禁用
+ */
 export function disabled(tools: string[], ruleset: Ruleset): Set<string> {
   const result = new Set<string>()
   for (const tool of tools) {
@@ -373,6 +493,8 @@ export function disabled(tools: string[], ruleset: Ruleset): Set<string> {
   return result
 }
 
+// 默认 Layer:装配 Bus 依赖
 export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
 
+// 以命名空间形式导出
 export * as Permission from "."
