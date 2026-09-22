@@ -1554,7 +1554,7 @@ ${用户原文}
 
 ### 4.10 压缩流程的用户侧提示词 —— `SUMMARY_TEMPLATE` 与 `buildPrompt`（compaction.ts 内联）
 
-- **使用场景**：3.2 的 compaction agent 收到的**用户消息**由此处拼装：`buildPrompt`（`session/compaction.ts:169-180`）根据是否已有旧摘要选择"更新"或"新建"引导语，再拼接固定摘要模板 `SUMMARY_TEMPLATE`（:71-106）与插件提供的 context。若配置/插件给了 `prompt` 则整体替换（:511 `compacting.prompt ?? buildPrompt(...)`）。
+- **使用场景**：3.2 的 compaction agent 收到的**用户消息**由此处拼装：`buildPrompt`（`session/compaction.ts:169-180`）根据是否已有旧摘要选择"更新"或"新建"引导语，再拼接固定摘要模板 `SUMMARY_TEMPLATE`（:71-106）与插件提供的 context。若配置/插件给了 `prompt` 则整体替换（:513 `compacting.prompt ?? buildPrompt(...)`）。
 - `buildPrompt` 两种引导语（:172-179）：
 
 ```
